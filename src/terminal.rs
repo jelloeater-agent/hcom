@@ -2420,7 +2420,10 @@ mod tests {
         assert!(preset.open.contains("{cwd}"));
         assert!(!preset.open.contains("{process_id}"));
         assert_eq!(preset.binary, Some("herdr"));
-        assert!(preset.close.unwrap().contains("{id}"));
+        // Close must use {pane_id} (stable raw `p_N`), not {id} (public
+        // `<ws>-<N>` which herdr renumbers when sibling panes close — a kill
+        // batch addressing the public id can land on the wrong pane).
+        assert!(preset.close.unwrap().contains("{pane_id}"));
     }
 
     #[test]

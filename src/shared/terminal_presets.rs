@@ -349,7 +349,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
                 Some("herdr"),
                 None,
                 "herdr agent start {instance_name} --cwd {cwd} --no-focus -- bash {script}",
-                Some("herdr pane close {id}"),
+                Some("herdr pane close {pane_id}"),
                 Some("HERDR_PANE_ID"),
                 DL,
             ),
