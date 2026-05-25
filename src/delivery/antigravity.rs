@@ -1,8 +1,10 @@
 //! Antigravity (agy) delivery — preview PTY wake; hook-primary message bodies.
 //!
-//! Full payloads are delivered via `gemini-beforeagent` / `gemini-aftertool`
-//! (`additionalContext` + `commit_delivery_ack`). The PTY thread injects a
-//! `<hcom>…</hcom>` preview (envelope + sender + snippet) + Enter when idle.
+//! Full payloads are delivered via `gemini-beforeagent` (`injectSteps` +
+//! `commit_delivery_ack`). `gemini-aftertool` maps to Antigravity `PostToolUse`,
+//! whose stdout contract is exactly `{}` and cannot carry message context.
+//! The PTY thread injects a `<hcom>…</hcom>` preview (envelope + sender +
+//! snippet) + Enter when idle.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

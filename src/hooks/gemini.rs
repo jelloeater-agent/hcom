@@ -291,7 +291,8 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::ensure_worker(true);
 
     // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
-    // Antigravity: inject at session bind as fallback when launch-time GEMINI_SYSTEM_MD was missed.
+    // Antigravity: primary bootstrap path (agy ignores GEMINI_SYSTEM_MD); inject_bootstrap_once
+    // is idempotent via the name_announced flag.
     if let Ok(Some(inst)) = db.get_instance_full(&instance_name)
         && bootstrap::is_antigravity_tool(&inst.tool)
         && let Some(bootstrap) =
@@ -397,6 +398,12 @@ fn handle_afteragent(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
         None => return hook_noop(),
     };
 
+    if payload.tool == "antigravity" || instance.tool == "antigravity" {
+        // Antigravity PostInvocation fires after each model invocation, including
+        // between tool calls. Stop/turn-end is the reliable idle boundary.
+        return hook_noop();
+    }
+
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
 
@@ -445,6 +452,12 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
     };
 
     let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    if is_agy {
+        // Antigravity PostToolUse cannot inject model context. Preparing delivery here would
+        // attach a delivery_ack that dispatch would commit even though serialization emits `{}`.
+        return hook_noop();
+    }
+
     let assembled = common::assemble_gemini_family_lifecycle_outputs(
         db,
         ctx,
@@ -509,6 +522,8 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         is_agy && crate::hooks::antigravity::stop_should_skip_soft_finalize(&payload.raw);
 
     if turn_idle_skip {
+        lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
+        common::notify_hook_instance_with_db(db, &instance.name);
         return hook_noop();
     }
 
@@ -546,7 +561,11 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
 
 /// Serialize hook stdout JSON.
 ///
-/// Lifecycle hooks (additionalContext): `hookSpecificOutput` for Gemini and Antigravity.
+/// Gemini lifecycle hooks: `hookSpecificOutput.additionalContext`.
+/// Antigravity PreInvocation/PostInvocation (mapped from gemini-sessionstart, -beforeagent,
+/// -afteragent) use `injectSteps[*].ephemeralMessage` per agy hooks docs.
+/// Antigravity PostToolUse (mapped from gemini-aftertool) cannot inject — must return `{}`,
+/// so additional_context from those handlers is dropped.
 /// Tool permission hooks: Antigravity uses flat `decision: deny` per agy-hooks.md.
 fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Option<Value> {
     let is_agy = tool == "antigravity";
@@ -556,6 +575,22 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
             additional_context, ..
         } => {
             if let Some(ctx) = additional_context {
+                if is_agy {
+                    // agy hook events are PreInvocation / PostInvocation / PostToolUse / Stop.
+                    // Only the Invocation events accept injectSteps.
+                    let supports_inject = matches!(
+                        hook_name,
+                        "gemini-sessionstart" | "gemini-beforeagent" | "gemini-afteragent"
+                    );
+                    if !supports_inject {
+                        // PostToolUse expects exactly `{}` — emitting anything else risks agy
+                        // discarding sibling hooks' output in the same phase.
+                        return Some(serde_json::json!({}));
+                    }
+                    return Some(serde_json::json!({
+                        "injectSteps": [ { "ephemeralMessage": ctx } ]
+                    }));
+                }
                 let event_name = match hook_name {
                     "gemini-sessionstart" => "SessionStart",
                     "gemini-beforeagent" => "BeforeAgent",
@@ -573,6 +608,15 @@ fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Op
                         "additionalContext": ctx,
                     }
                 }))
+            } else if is_agy {
+                // agy noop: emit valid JSON rather than empty stdout. PreToolUse REQUIRES a
+                // decision field — `{}` is interpreted as deny and breaks all tool calls.
+                // Other phases tolerate `{}`.
+                if hook_name == "gemini-beforetool" {
+                    Some(serde_json::json!({ "decision": "allow" }))
+                } else {
+                    Some(serde_json::json!({}))
+                }
             } else {
                 None
             }
@@ -2974,8 +3018,14 @@ mod tests {
             system_message: None,
             delivery_ack: None,
         };
-        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result);
-        assert!(out.is_none());
+        // PreToolUse REQUIRES `decision` — `{}` is treated as deny and blocks all tools.
+        let beforetool =
+            serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(beforetool, serde_json::json!({ "decision": "allow" }));
+
+        // Other phases (PostToolUse, PreInvocation noop, etc.) emit `{}`.
+        let aftertool = serialize_hook_result("antigravity", "gemini-aftertool", &result).unwrap();
+        assert_eq!(aftertool, serde_json::json!({}));
     }
 
     #[test]
@@ -2985,13 +3035,19 @@ mod tests {
             system_message: None,
             delivery_ack: None,
         };
+        // agy PreInvocation/PostInvocation hooks accept injectSteps; hookSpecificOutput is
+        // silently ignored. Only gemini-sessionstart, -beforeagent, -afteragent emit injection.
         let out = serialize_hook_result("antigravity", "gemini-beforeagent", &result).unwrap();
-        assert_eq!(out["decision"], "allow");
-        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
         assert_eq!(
-            out["hookSpecificOutput"]["additionalContext"],
+            out["injectSteps"][0]["ephemeralMessage"],
             "pending messages"
         );
+        assert!(out.get("hookSpecificOutput").is_none());
+        assert!(out.get("decision").is_none());
+
+        // PostToolUse (gemini-aftertool) cannot inject in agy — drop context, emit `{}`.
+        let aftertool = serialize_hook_result("antigravity", "gemini-aftertool", &result).unwrap();
+        assert_eq!(aftertool, serde_json::json!({}));
     }
 
     #[test]
@@ -3055,6 +3111,126 @@ mod tests {
             "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, 'active', ?2, ?3)",
             rusqlite::params![name, now, tool],
         ).unwrap();
+    }
+
+    fn insert_test_message(db: &HcomDb, instance: &str, from: &str, text: &str) -> i64 {
+        let data = serde_json::json!({
+            "from": from,
+            "text": text,
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', ?1, ?2)",
+                rusqlite::params![instance, data],
+            )
+            .unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    #[test]
+    fn test_antigravity_aftertool_does_not_ack_pending_delivery() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+        let message_id = insert_test_message(&db, "homo", "homo", "secret body");
+
+        let env: HashMap<String, String> = [("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_aftertool(&db, &ctx, &payload);
+        match result {
+            HookResult::Allow {
+                additional_context,
+                delivery_ack,
+                ..
+            } => {
+                assert!(additional_context.is_none());
+                assert!(delivery_ack.is_none());
+            }
+            _ => panic!("expected Allow"),
+        }
+
+        let cursor: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'vago'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 0);
+        assert_eq!(db.get_unread_messages("vago").len(), 1);
+        assert_eq!(db.get_unread_messages("vago")[0].event_id, Some(message_id));
+    }
+
+    #[test]
+    fn test_antigravity_afteragent_does_not_mark_idle_mid_turn() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-afteragent".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_afteragent(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+        let instance = db.get_instance_full("vago").unwrap().unwrap();
+        assert_eq!(instance.status, "active");
+    }
+
+    #[test]
+    fn test_antigravity_turn_end_stop_marks_idle() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-sessionend".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::json!({
+                "fullyIdle": true,
+                "terminationReason": "NO_TOOL_CALL",
+            }),
+        };
+
+        let result = handle_sessionend(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+        let instance = db.get_instance_full("vago").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
     }
 
     #[test]

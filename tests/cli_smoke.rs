@@ -461,13 +461,10 @@ fn antigravity_e2e_hook_dispatch() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    // With silent allow, stdout should be empty
-    assert!(
-        stdout.trim().is_empty(),
-        "stdout should be empty on allow: {stdout}"
-    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("beforetool json");
+    assert_eq!(parsed, serde_json::json!({ "decision": "allow" }));
 
-    // 3. AfterTool with pending message → hookSpecificOutput delivery schema.
+    // 3. AfterTool cannot inject context for Antigravity, so it must not ack delivery.
     let (send_code, _, send_stderr) = h.run([
         "send",
         &format!("@{me}"),
@@ -518,11 +515,5 @@ fn antigravity_e2e_hook_dispatch() {
     let after_stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(after_stdout.trim()).expect("aftertool json");
-    assert_eq!(parsed["decision"], "allow");
-    assert!(parsed.get("hookSpecificOutput").is_some());
-    assert!(
-        parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    );
+    assert_eq!(parsed, serde_json::json!({}));
 }

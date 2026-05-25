@@ -111,7 +111,7 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 const ANTIGRAVITY_DELIVERY: &str = r#"## ANTIGRAVITY DELIVERY (hook-primary)
 
 Antigravity delivers hcom messages through hooks, not only the prompt line:
-- `<hcom>…</hcom>` in the prompt is a **preview** (sender + snippet). The full message body is also in hook `additionalContext` on this turn (`beforeagent` / `aftertool`). Read both; act on the delivery block first.
+- `<hcom>…</hcom>` in the prompt is a **preview** (sender + snippet). The full message body is injected into your context at the start of this turn (before the model is called). Read both; act on the delivery block first.
 - On a prompt that is only `<hcom>`: do **not** run `hcom --help`, `hcom list`, `hcom listen`, `hcom events`, `ListDir`, `Read`, or git/status on the hcom repo unless the delivery below tells you to.
 - When a delivery has `intent=request`: your **first** tool call must be `hcom send @{SENDER} ...` — no exploration first.
 - After `hcom send`, end your turn so the next delivery can arrive.
