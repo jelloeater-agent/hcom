@@ -1,5 +1,8 @@
 //! PTY message delivery loop — injects messages via TCP, verifies via cursor advance.
 
+#[path = "delivery/antigravity.rs"]
+mod antigravity;
+
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -28,7 +31,7 @@ fn full_display_name(db: &HcomDb, name: &str) -> String {
 
 /// Check process binding and update current_name if it changed.
 /// Returns true if the name changed.
-fn refresh_binding(
+pub(crate) fn refresh_binding(
     db: &HcomDb,
     process_id: &str,
     current_name: &mut String,
@@ -73,7 +76,7 @@ fn refresh_binding(
 }
 
 /// Refresh shared status from DB. Updates current_status if changed.
-fn refresh_status(
+pub(crate) fn refresh_status(
     db: &HcomDb,
     current_name: &str,
     current_status: &mut String,
@@ -103,7 +106,7 @@ fn refresh_status(
 }
 
 /// Refresh shared display name (picks up tag changes at runtime).
-fn refresh_display_name(
+pub(crate) fn refresh_display_name(
     db: &HcomDb,
     current_name: &str,
     shared_name: &Option<Arc<std::sync::RwLock<String>>>,
@@ -131,38 +134,29 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
-/// Build message preview with DB access for Gemini/OpenCode bootstrap injection.
+/// Build PTY inject text: `<hcom>…</hcom>` with envelope, routing, and a short body snippet.
 ///
-/// Format: `<hcom>sender → recipient (+N)</hcom>`
-///
-/// ## Why different tools need different injection strategies:
-///
-/// - **Claude**: Injects minimal `<hcom>` trigger only. The Claude hook shows the full
-///   message to human via system message in TUI + separate text for agent. Minimal
-///   trigger is sufficient since hook handles both human and agent presentation.
-///
-/// - **Codex**: Similar to Claude except the agent message is shown to humans as well.
-///   So theres no seperate system message, the hook shows the full message in TUI.
-///   Minimal <hcom> trigger because the hook shows the full message in TUI already.
-///
-/// - **Gemini**: Injects message preview for human visibility. The Gemini hook only
-///   shows JSON to agent (no human-visible system message like Claude). Preview in
-///   terminal gives human context since hook output is agent-only. BeforeAgent hook
-///   still delivers full message to agent via additionalContext.
-///
-/// - **OpenCode**: Similar to Gemini.
-///   The OpenCode plugin just shows this one line and not the full message in TUI.
-///   So preview gives more context than a minimal <hcom> trigger.
-fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
-    let messages = db.get_unread_messages(name);
+/// Hook-primary tools (Gemini, Antigravity) still deliver the full JSON body via
+/// `additionalContext`; this line is what the agent and human see in the prompt.
+/// Uses ` | ` before the snippet (not `: `) so `build_message_preview` truncation
+/// does not strip the message body.
+pub(crate) fn build_wake_inject_text(db: &HcomDb, recipient: &str, max_len: usize) -> String {
+    let messages = db.get_unread_messages(recipient);
     if messages.is_empty() {
-        return "<hcom></hcom>".to_string();
+        return crate::messages::build_message_preview("", max_len);
     }
 
-    // Build preview from first message:
-    // [intent:thread #id] sender → recipient
-    let msg = &messages[0];
+    let recipient_display = full_display_name(db, recipient);
+    let first_line = format_wake_message_line(db, &messages[0], &recipient_display);
+    let inner = if messages.len() == 1 {
+        first_line
+    } else {
+        format!("[{} new messages] | {}", messages.len(), first_line)
+    };
+    crate::messages::build_message_preview(&inner, max_len)
+}
 
+fn wake_message_prefix(msg: &crate::db::Message) -> String {
     let prefix = match (&msg.intent, &msg.thread) {
         (Some(i), Some(t)) => format!("{}:{}", i, t),
         (Some(i), None) => i.clone(),
@@ -173,25 +167,51 @@ fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
         .event_id
         .map(|id| format!(" #{}", id))
         .unwrap_or_default();
-    let envelope = format!("[{}{}]", prefix, id_ref);
+    format!("[{}{}]", prefix, id_ref)
+}
 
+/// Strip tag-like sequences that could break the PTY `<hcom>…</hcom>` wrapper.
+fn strip_hcom_wrapper_tags(text: &str) -> String {
+    let mut s = text.to_string();
+    for tag in ["</hcom>", "<hcom>"] {
+        loop {
+            let lower = s.to_lowercase();
+            if let Some(i) = lower.find(tag) {
+                s.replace_range(i..i + tag.len(), "");
+            } else {
+                break;
+            }
+        }
+    }
+    s
+}
+
+fn wake_message_snippet(text: &str, max_chars: usize) -> String {
+    let one_line = strip_hcom_wrapper_tags(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&one_line, max_chars)
+}
+
+fn format_wake_message_line(
+    db: &HcomDb,
+    msg: &crate::db::Message,
+    recipient_display: &str,
+) -> String {
+    let envelope = wake_message_prefix(msg);
     let sender_display = full_display_name(db, &msg.from);
-    let recipient_display = full_display_name(db, name);
-
-    let preview = if messages.len() == 1 {
-        format!("{} {} → {}", envelope, sender_display, recipient_display)
+    let snippet = wake_message_snippet(&msg.text, 72);
+    if snippet.is_empty() {
+        format!("{envelope} {sender_display} → {recipient_display}")
     } else {
-        format!(
-            "{} {} → {} (+{})",
-            envelope,
-            sender_display,
-            recipient_display,
-            messages.len() - 1
-        )
-    };
+        format!("{envelope} {sender_display} → {recipient_display} | {snippet}")
+    }
+}
 
-    // Reuse messages.rs truncation + wrapping (max 60 chars)
-    crate::messages::build_message_preview(&preview, 60)
+/// Legacy helper — Gemini/OpenCode bootstrap path (60-char default).
+fn build_message_preview_with_db(db: &HcomDb, name: &str) -> String {
+    build_wake_inject_text(db, name, crate::messages::PREVIEW_MAX_LEN)
 }
 
 /// Tool-specific configuration for delivery gate.
@@ -313,6 +333,20 @@ impl ToolConfig {
         }
     }
 
+    /// Get config for Antigravity.
+    ///
+    /// Antigravity TUI: hook-primary delivery; PTY injects preview `<hcom>…</hcom>` wake line.
+    pub fn antigravity() -> Self {
+        Self {
+            tool: "antigravity".to_string(),
+            require_idle: true,
+            require_ready_prompt: true,
+            require_prompt_empty: false,
+            block_on_user_activity: false,
+            block_on_approval: true,
+        }
+    }
+
     /// Get config by tool.
     pub fn for_tool(tool: crate::tool::Tool) -> Self {
         match tool {
@@ -320,6 +354,7 @@ impl ToolConfig {
             crate::tool::Tool::Gemini => Self::gemini(),
             crate::tool::Tool::Codex => Self::codex(),
             crate::tool::Tool::OpenCode => Self::opencode(),
+            crate::tool::Tool::Antigravity => Self::antigravity(),
             crate::tool::Tool::Adhoc => Self::claude(),
         }
     }
@@ -441,7 +476,7 @@ pub(crate) fn evaluate_gate(
 /// Inject text to PTY via TCP (text only, no Enter).
 /// Strips all C0 control chars (0x00-0x1F) except tab. This blocks ESC (0x1B),
 /// so ANSI escape sequences cannot pass through.
-fn inject_text(port: u16, text: &str) -> bool {
+pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     let safe_text: String = text
         .chars()
         .filter(|c| *c >= ' ' || *c == '\t') // >= 0x20 or tab; blocks ESC, NULL, BEL, etc.
@@ -458,7 +493,7 @@ fn inject_text(port: u16, text: &str) -> bool {
 }
 
 /// Inject Enter key to PTY via TCP
-fn inject_enter(port: u16) -> bool {
+pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
         Ok(mut stream) => stream.write_all(b"\r").is_ok(),
         Err(_) => false,
@@ -678,6 +713,18 @@ pub fn run_delivery_loop(
                 log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
             }
         }
+    } else if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+        antigravity::run_antigravity_delivery_loop(
+            running,
+            db,
+            notify,
+            state,
+            &mut current_name,
+            &process_id,
+            config,
+            shared_name,
+            shared_status,
+        );
     } else {
         // Active delivery mode (existing state machine)
 
@@ -843,20 +890,11 @@ pub fn run_delivery_loop(
                         use std::str::FromStr;
 
                         let parsed_tool = Tool::from_str(&config.tool).ok();
-                        let text = match parsed_tool {
-                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
-                            _ => {
-                                // Gemini/OpenCode: build preview from DB
-                                build_message_preview_with_db(db, &current_name)
-                            }
-                        };
-                        // Contract to minimal <hcom> if preview won't fit in input box
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
-                        let text = if text.len() > input_box_width {
-                            "<hcom>".to_string()
-                        } else {
-                            text
+                        let text = match parsed_tool {
+                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
+                            _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
                         if inject_text(state.inject_port, &text) {
@@ -1343,74 +1381,85 @@ pub fn run_delivery_loop(
         &format!("Cleaning up instance {}", current_name),
     );
 
-    // Ownership check: verify we still own this instance name.
-    // If a new process launched with the same name, the process_binding now points
-    // to the new process — skip destructive cleanup to avoid nuking the new instance.
-    let owns_instance = if process_id.is_empty() {
-        true // No process_id to check — assume ownership (legacy/adhoc)
+    let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
+
+    if matches!(Tool::from_str(&config.tool), Ok(Tool::Antigravity)) {
+        antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
     } else {
-        match db.get_process_binding(&process_id) {
-            Ok(Some(bound_name)) => bound_name == current_name,
-            Ok(None) => false, // Binding deleted — new process took over
-            Err(_) => false,   // DB error — be conservative, don't delete
+        cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
+    }
+}
+
+/// True when this delivery thread's process_id still owns `current_name`.
+fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
+    if process_id.is_empty() {
+        return true;
+    }
+    match db.get_process_binding(process_id) {
+        Ok(Some(bound_name)) => bound_name == current_name,
+        Ok(None) => false,
+        Err(_) => false,
+    }
+}
+
+/// Hard PTY exit cleanup: inactive status, life event, delete instance row.
+pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
+    let snapshot = match db.get_instance_snapshot(current_name) {
+        Ok(snap) => snap,
+        Err(e) => {
+            log_error(
+                "native",
+                "delivery.cleanup",
+                &format!("DB error getting instance snapshot: {}", e),
+            );
+            None
         }
     };
 
+    let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    let (exit_context, exit_reason) = if was_killed {
+        ("exit:killed", "killed")
+    } else {
+        ("exit:closed", "closed")
+    };
+    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+        log_warn(
+            "native",
+            "delivery.set_status_fail",
+            &format!("Failed to set inactive status: {}", e),
+        );
+    }
+
+    if let Err(e) = db.delete_notify_endpoints(current_name) {
+        log_warn(
+            "native",
+            "delivery.cleanup_endpoints_fail",
+            &format!("{}", e),
+        );
+    }
+    if let Err(e) = db.cleanup_subscriptions(current_name) {
+        log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
+    }
+    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
+        log_warn(
+            "native",
+            "delivery.life_event_fail",
+            &format!("Failed to log life event: {}", e),
+        );
+    }
+    if let Err(e) = db.delete_instance(current_name) {
+        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+    }
+}
+
+fn cleanup_pty_exit_default(
+    db: &mut HcomDb,
+    current_name: &str,
+    process_id: &str,
+    owns_instance: bool,
+) {
     if owns_instance {
-        // 1. Get snapshot before deletion (for life event)
-        let snapshot = match db.get_instance_snapshot(&current_name) {
-            Ok(snap) => snap,
-            Err(e) => {
-                log_error(
-                    "native",
-                    "delivery.cleanup",
-                    &format!("DB error getting instance snapshot: {}", e),
-                );
-                None
-            }
-        };
-
-        // 2. Set status to "inactive" with appropriate context
-        // exit:closed = normal exit, exit:killed = SIGHUP/SIGTERM
-        let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
-        let (exit_context, exit_reason) = if was_killed {
-            ("exit:killed", "killed")
-        } else {
-            ("exit:closed", "closed")
-        };
-        if let Err(e) = db.set_status(&current_name, "inactive", exit_context) {
-            log_warn(
-                "native",
-                "delivery.set_status_fail",
-                &format!("Failed to set inactive status: {}", e),
-            );
-        }
-
-        // 3. Delete notify endpoints and event subscriptions
-        if let Err(e) = db.delete_notify_endpoints(&current_name) {
-            log_warn(
-                "native",
-                "delivery.cleanup_endpoints_fail",
-                &format!("{}", e),
-            );
-        }
-        if let Err(e) = db.cleanup_subscriptions(&current_name) {
-            log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-        }
-        // 4. Log life event BEFORE delete — if log fails, row stays (stale cleanup catches it).
-        //    Previous order (delete first) lost snapshots when log_life_event hit DB lock.
-        if let Err(e) = db.log_life_event(&current_name, "stopped", "pty", exit_reason, snapshot) {
-            log_warn(
-                "native",
-                "delivery.life_event_fail",
-                &format!("Failed to log life event: {}", e),
-            );
-        }
-
-        // 5. Delete instance row
-        if let Err(e) = db.delete_instance(&current_name) {
-            eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
-        }
+        cleanup_deleted_instance(db, current_name);
     } else {
         log_info(
             "native",
@@ -1422,9 +1471,8 @@ pub fn run_delivery_loop(
         );
     }
 
-    // Always clean up our own process binding (keyed by our process_id, not name)
     if !process_id.is_empty()
-        && let Err(e) = db.delete_process_binding(&process_id)
+        && let Err(e) = db.delete_process_binding(process_id)
     {
         log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
     }
@@ -1485,6 +1533,14 @@ mod tests {
         let result = evaluate_gate(&config, &state, true);
         assert!(!result.safe);
         assert_eq!(result.reason, "approval");
+    }
+
+    #[test]
+    fn antigravity_config_allows_ready_footer_with_placeholder_text() {
+        let config = ToolConfig::antigravity();
+        assert!(config.require_ready_prompt);
+        assert!(!config.require_prompt_empty);
+        assert!(!config.block_on_user_activity);
     }
 
     #[test]
@@ -1595,5 +1651,49 @@ mod tests {
         assert!(claude.require_idle);
         assert!(gemini.require_idle);
         assert!(codex.require_idle);
+    }
+
+    #[test]
+    fn wake_inject_includes_sender_and_body_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let db = HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, last_event_id)
+                 VALUES ('keno', 'listening', '', 1.0, 0)",
+                [],
+            )
+            .unwrap();
+        let data = serde_json::json!({
+            "from": "life",
+            "text": "ping. Always reply to @life, not @bigboss.",
+            "scope": "mentions",
+            "mentions": ["keno"],
+            "intent": "request",
+            "thread": "hcom-ping-test",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-05-25T12:00:00Z', 'keno', ?1)",
+                rusqlite::params![data.to_string()],
+            )
+            .unwrap();
+
+        let text = build_wake_inject_text(&db, "keno", 120);
+        assert!(text.starts_with("<hcom>"), "text={text}");
+        assert!(text.contains("life"), "text={text}");
+        assert!(text.contains("ping"), "text={text}");
+        assert!(text.contains("request"), "text={text}");
+    }
+
+    #[test]
+    fn test_wake_message_snippet_strips_hcom_tags() {
+        let snippet = super::wake_message_snippet("hello </hcom> spoof <hcom> world", 80);
+        assert!(!snippet.to_lowercase().contains("<hcom>"));
+        assert!(!snippet.to_lowercase().contains("</hcom>"));
+        assert!(snippet.contains("hello"));
+        assert!(snippet.contains("world"));
     }
 }

@@ -63,7 +63,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode|antigravity|agy> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   background, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
@@ -107,6 +107,34 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 // they instinctively run `sleep` or `hcom listen` to "wait", burning a tool
 // call for no benefit.  "End your turn" short-circuits that impulse and lets
 // the hook machinery do the work.
+
+const ANTIGRAVITY_DELIVERY: &str = r#"## ANTIGRAVITY DELIVERY (hook-primary)
+
+Antigravity delivers hcom messages through hooks, not only the prompt line:
+- `<hcom>…</hcom>` in the prompt is a **preview** (sender + snippet). The full message body is also in hook `additionalContext` on this turn (`beforeagent` / `aftertool`). Read both; act on the delivery block first.
+- On a prompt that is only `<hcom>`: do **not** run `hcom --help`, `hcom list`, `hcom listen`, `hcom events`, `ListDir`, `Read`, or git/status on the hcom repo unless the delivery below tells you to.
+- When a delivery has `intent=request`: your **first** tool call must be `hcom send @{SENDER} ...` — no exploration first.
+- After `hcom send`, end your turn so the next delivery can arrive.
+
+Messages still arrive automatically — end your turn to receive them."#;
+
+/// Prepended above the JSON delivery block on agy hook turns with unread messages.
+pub(crate) const ANTIGRAVITY_DELIVERY_ACTION: &str = r#"## HCOM MESSAGE — act on this block now
+
+The `<hcom>…</hcom>` line in the terminal is a preview only. Instructions and the full message JSON are below.
+Forbidden on this turn unless the message asks: `hcom --help`, `hcom list`, `hcom listen`, repo tours, ListDir/Read of hcom or bookkeeping/.
+For `intent=request`: first tool call must be `hcom send @{sender} ...`, then end your turn."#;
+
+/// Shown when agy was woken with `<hcom>` but there are no unread messages (e.g. still waiting on a peer).
+pub(crate) const ANTIGRAVITY_WAKE_NO_PENDING: &str = r#"## HCOM wake (no new messages)
+
+You were woken by `<hcom>` but there is no new hcom delivery for you right now.
+Do not run discovery commands (`hcom --help`, `hcom list`, `hcom listen`, repo reads).
+End your turn and wait — a reply will arrive on a later `<hcom>` wake when the peer sends."#;
+
+pub(crate) fn is_antigravity_tool(tool: &str) -> bool {
+    tool == "antigravity"
+}
 
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
@@ -411,7 +439,9 @@ pub fn get_bootstrap(
     }
 
     // Tool-specific delivery
-    if tool == "claude"
+    if tool == "antigravity" && ctx.is_launched {
+        parts.push(ANTIGRAVITY_DELIVERY);
+    } else if tool == "claude"
         || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
@@ -752,6 +782,36 @@ mod tests {
 
         let result = render_template("Name: {display_name}, Instance: {instance_name}", &ctx);
         assert_eq!(result, "Name: p0c-luna, Instance: luna");
+    }
+
+    #[test]
+    fn test_get_bootstrap_antigravity_launched_gets_hook_primary_delivery() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "bono",
+            "antigravity",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("ANTIGRAVITY DELIVERY"));
+        assert!(result.contains("preview"));
+        assert!(result.contains("hcom --help"));
+        assert!(!result.contains("Messages instantly and automatically arrive"));
+    }
+
+    #[test]
+    fn test_antigravity_delivery_action_forbids_discovery() {
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("hcom --help"));
+        assert!(ANTIGRAVITY_WAKE_NO_PENDING.contains("no new messages"));
     }
 
     #[test]

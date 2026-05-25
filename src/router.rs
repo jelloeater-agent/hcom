@@ -43,7 +43,16 @@ const COMMANDS: &[&str] = &[
 ];
 
 /// Tools that support launch commands (hcom [N] <tool>)
-const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "f", "r"];
+const LAUNCH_TOOLS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "antigravity",
+    "agy",
+    "f",
+    "r",
+];
 
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
@@ -92,6 +101,10 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             String::new(),
         ),
         Tool::OpenCode => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
+        Tool::Antigravity => (
+            crate::hooks::gemini::dispatch_gemini_hook(hook),
+            String::new(),
+        ),
         Tool::Adhoc => unreachable!("adhoc has no hooks"),
     }
 }
@@ -1080,6 +1093,34 @@ mod tests {
             action,
             Action::Launch {
                 args: sv(&["--name", "mybot", "--go", "claude"])
+            }
+        );
+    }
+
+    #[test]
+    fn launch_antigravity_direct() {
+        let action = resolve_action(&sv(&["antigravity"]));
+        assert_eq!(
+            action,
+            Action::Launch {
+                args: sv(&["antigravity"])
+            }
+        );
+    }
+
+    #[test]
+    fn launch_agy_direct() {
+        let action = resolve_action(&sv(&["agy"]));
+        assert_eq!(action, Action::Launch { args: sv(&["agy"]) });
+    }
+
+    #[test]
+    fn launch_agy_with_count() {
+        let action = resolve_action(&sv(&["3", "agy", "--some-flag"]));
+        assert_eq!(
+            action,
+            Action::Launch {
+                args: sv(&["3", "agy", "--some-flag"])
             }
         );
     }

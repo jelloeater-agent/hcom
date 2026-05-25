@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::{HookPayload, HookResult};
@@ -18,7 +19,7 @@ use crate::instances;
 use crate::log;
 use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
-use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
+use crate::shared::{ST_BLOCKED, ST_LISTENING};
 
 /// Derive Gemini CLI transcript path from session_id.
 ///
@@ -178,8 +179,8 @@ fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
         return None;
     }
 
-    // Only check run_shell_command tool responses
-    if payload.tool_name != "run_shell_command" {
+    // Only check run_shell_command (gemini) or run_command (antigravity) tool responses
+    if payload.tool_name != "run_shell_command" && payload.tool_name != "run_command" {
         return None;
     }
 
@@ -196,7 +197,7 @@ fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
         &instance_name,
         payload.session_id.as_deref(),
         payload.transcript_path.as_deref(),
-        "gemini",
+        &payload.tool,
         "gemini-aftertool",
     )
 }
@@ -289,8 +290,20 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);
 
-    // Bootstrap injection moved to BeforeAgent only
-    // Reason: Gemini doesn't display SessionStart hook output after /clear
+    // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
+    // Antigravity: inject at session bind as fallback when launch-time GEMINI_SYSTEM_MD was missed.
+    if let Ok(Some(inst)) = db.get_instance_full(&instance_name)
+        && bootstrap::is_antigravity_tool(&inst.tool)
+        && let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, &instance_name, &inst, &inst.tool)
+    {
+        return HookResult::Allow {
+            additional_context: Some(bootstrap),
+            system_message: None,
+            delivery_ack: None,
+        };
+    }
+
     hook_noop()
 }
 
@@ -346,34 +359,34 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
 
     try_capture_transcript_path(db, instance_name, payload);
 
-    let mut outputs: Vec<String> = Vec::new();
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: true,
+        },
+    );
 
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
+    if let Some(wake_only) = assembled.early_wake_context {
+        return HookResult::Allow {
+            additional_context: Some(wake_only),
+            system_message: None,
+            delivery_ack: None,
+        };
     }
 
-    // Deliver pending messages
-    let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
-    } else {
-        // Real user prompt (not hcom injection)
-        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-    }
-
-    if outputs.is_empty() {
+    if assembled.parts.is_empty() {
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -431,32 +444,26 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
         None => return hook_noop(),
     };
 
-    let instance_name = &instance.name;
-    let mut outputs: Vec<String> = Vec::new();
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: false,
+        },
+    );
 
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
-    }
-
-    // Deliver pending messages (JSON format)
-    let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
-    }
-
-    if outputs.is_empty() {
+    if assembled.parts.is_empty() {
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -481,18 +488,35 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
 }
 
 /// Handle SessionEnd hook - fires when a session ends.
-fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     let instance = match resolve_instance_gemini(db, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
 
-    let reason = payload
-        .raw
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    common::finalize_session(db, &instance.name, reason, None);
+    let is_agy = payload.tool == "antigravity" || instance.tool == "antigravity";
+    let reason = if is_agy {
+        crate::hooks::antigravity::sessionend_reason(&payload.raw)
+    } else {
+        payload
+            .raw
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let turn_idle_skip =
+        is_agy && crate::hooks::antigravity::stop_should_skip_soft_finalize(&payload.raw);
+
+    if turn_idle_skip {
+        return hook_noop();
+    }
+
+    if ctx.is_launched && is_agy {
+        common::soft_finalize_session(db, &instance.name, &reason, None);
+    } else {
+        common::finalize_session(db, &instance.name, &reason, None);
+    }
 
     hook_noop()
 }
@@ -520,6 +544,74 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
     }
 }
 
+/// Serialize hook stdout JSON.
+///
+/// Lifecycle hooks (additionalContext): `hookSpecificOutput` for Gemini and Antigravity.
+/// Tool permission hooks: Antigravity uses flat `decision: deny` per agy-hooks.md.
+fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Option<Value> {
+    let is_agy = tool == "antigravity";
+    match result {
+        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
+        HookResult::Allow {
+            additional_context, ..
+        } => {
+            if let Some(ctx) = additional_context {
+                let event_name = match hook_name {
+                    "gemini-sessionstart" => "SessionStart",
+                    "gemini-beforeagent" => "BeforeAgent",
+                    "gemini-afteragent" => "AfterAgent",
+                    "gemini-beforetool" => "BeforeTool",
+                    "gemini-aftertool" => "AfterTool",
+                    "gemini-notification" => "Notification",
+                    "gemini-sessionend" => "SessionEnd",
+                    _ => hook_name,
+                };
+                Some(serde_json::json!({
+                    "decision": "allow",
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": ctx,
+                    }
+                }))
+            } else {
+                None
+            }
+        }
+        HookResult::Block { reason } => {
+            if is_agy {
+                Some(serde_json::json!({
+                    "decision": "deny",
+                    "reason": reason,
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "decision": "block",
+                    "reason": reason,
+                }))
+            }
+        }
+        HookResult::UpdateInput { updated_input } => {
+            Some(serde_json::json!({ "updatedInput": updated_input }))
+        }
+    }
+}
+
+/// Whether stdin/context should route through Antigravity payload parsing.
+///
+/// Order: `ANTIGRAVITY_AGENT` env → exclude `GEMINI_CLI` gemini → `toolCall` schema fallback.
+pub(crate) fn detect_antigravity_payload(ctx: &HcomContext, stdin_json: &Value) -> (bool, bool) {
+    if ctx.is_antigravity {
+        return (true, false);
+    }
+    if ctx.is_gemini {
+        return (false, false);
+    }
+    if stdin_json.get("toolCall").is_some() {
+        return (true, true);
+    }
+    (false, false)
+}
+
 /// Main entry point for Gemini hooks — called by router.
 ///
 /// Reads stdin JSON, builds HookPayload + HcomContext, dispatches to handler.
@@ -537,8 +629,23 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         Err(_) => Value::Object(Default::default()),
     };
 
-    // Build payload
-    let payload = HookPayload::from_gemini(stdin_json);
+    let (is_agy, agy_fallback) = detect_antigravity_payload(&ctx, &stdin_json);
+    if agy_fallback {
+        static AGY_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+        AGY_FALLBACK_LOGGED.call_once(|| {
+            log::log_warn(
+                "hooks",
+                "gemini.agy_detect_fallback",
+                "Antigravity payload detected via toolCall without ANTIGRAVITY_AGENT; set env at launch",
+            );
+        });
+    }
+
+    let payload = if is_agy {
+        HookPayload::from_antigravity(stdin_json, hook_name)
+    } else {
+        HookPayload::from_gemini(stdin_json)
+    };
 
     // Pre-gate: skip BeforeAgent for non-participants
     if !ctx.is_launched && hook_name == "gemini-beforeagent" {
@@ -619,44 +726,9 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         ),
     );
 
-    // Output result JSON to stdout — Gemini expects hookSpecificOutput wrapper
+    // Output result JSON to stdout
     let exit_code = result.exit_code();
-    let output_json = match &result {
-        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
-        HookResult::Allow {
-            additional_context, ..
-        } => {
-            if let Some(ctx) = additional_context {
-                // Map hook name to Gemini event name (e.g. "gemini-beforeagent" → "BeforeAgent")
-                let event_name = match hook_name {
-                    "gemini-sessionstart" => "SessionStart",
-                    "gemini-beforeagent" => "BeforeAgent",
-                    "gemini-afteragent" => "AfterAgent",
-                    "gemini-beforetool" => "BeforeTool",
-                    "gemini-aftertool" => "AfterTool",
-                    "gemini-notification" => "Notification",
-                    "gemini-sessionend" => "SessionEnd",
-                    _ => hook_name,
-                };
-                Some(serde_json::json!({
-                    "decision": "allow",
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": ctx,
-                    }
-                }))
-            } else {
-                None
-            }
-        }
-        HookResult::Block { reason } => Some(serde_json::json!({
-            "decision": "block",
-            "reason": reason,
-        })),
-        HookResult::UpdateInput { updated_input } => {
-            Some(serde_json::json!({ "updatedInput": updated_input }))
-        }
-    };
+    let output_json = serialize_hook_result(&payload.tool, hook_name, &result);
     if let Some(json) = output_json {
         let mut stdout = std::io::stdout().lock();
         if serde_json::to_writer(&mut stdout, &json).is_ok()
@@ -794,16 +866,8 @@ fn build_all_permission_patterns() -> Vec<String> {
     patterns
 }
 
-/// Resolve the Gemini config directory.
-///
-/// Priority: GEMINI_CLI_HOME env var (+ .gemini suffix) → tool_config_root()/.gemini
 fn gemini_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join(".gemini");
-    }
-    crate::runtime_env::tool_config_root().join(".gemini")
+    crate::runtime_env::gemini_family_config_dir()
 }
 
 /// Get path to Gemini policies directory.
@@ -1712,6 +1776,57 @@ mod tests {
     fn test_get_handler_unknown() {
         assert!(get_handler("gemini-unknown").is_none());
         assert!(get_handler("sessionstart").is_none());
+    }
+
+    #[test]
+    fn test_detect_antigravity_via_env() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_gemini_session_without_tool_call() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("GEMINI_CLI", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc", "conversationId": "legacy"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(!is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_antigravity_tool_call_fallback() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({
+            "conversationId": "6f000787",
+            "toolCall": {"name": "run_command", "args": {}}
+        });
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(fallback);
     }
 
     #[test]
@@ -2850,5 +2965,159 @@ mod tests {
         );
 
         drop(_guard);
+    }
+
+    #[test]
+    fn test_antigravity_serialization_allow_no_context() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_antigravity_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("pending messages".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforeagent", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "pending messages"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_serialization_block() {
+        let result = HookResult::Block {
+            reason: "permission denied".to_string(),
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["reason"], "permission denied");
+        assert!(out.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_serialization_update_input() {
+        let result = HookResult::UpdateInput {
+            updated_input: serde_json::json!({"command": "ls -l"}),
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["updatedInput"]["command"], "ls -l");
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_no_context() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("injected context".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeTool");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "injected context"
+        );
+    }
+
+    fn make_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, tool: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn().execute(
+            "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, 'active', ?2, ?3)",
+            rusqlite::params![name, now, tool],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_bind_vanilla_instance_gemini_success() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "luna", "gemini");
+
+        let payload = HookPayload {
+            session_id: Some("sess-v1".to_string()),
+            transcript_path: Some("/tmp/t1.jsonl".to_string()),
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "gemini".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: "[hcom:luna] done".to_string(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = bind_vanilla_instance(&db, &payload);
+        assert_eq!(result, Some("luna".to_string()));
+
+        // Session binding should be created
+        assert_eq!(
+            db.get_session_binding("sess-v1").unwrap(),
+            Some("luna".to_string())
+        );
+
+        // Instance should have session_id set
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("sess-v1"));
+        assert_eq!(inst.tool, "gemini");
+    }
+
+    #[test]
+    fn test_bind_vanilla_instance_antigravity_success() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova", "antigravity");
+
+        let payload = HookPayload {
+            session_id: Some("sess-v2".to_string()),
+            transcript_path: Some("/tmp/t2.jsonl".to_string()),
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: "[hcom:nova] done".to_string(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = bind_vanilla_instance(&db, &payload);
+        assert_eq!(result, Some("nova".to_string()));
+
+        // Session binding should be created
+        assert_eq!(
+            db.get_session_binding("sess-v2").unwrap(),
+            Some("nova".to_string())
+        );
+
+        // Instance should have session_id set
+        let inst = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("sess-v2"));
+        assert_eq!(inst.tool, "antigravity");
     }
 }

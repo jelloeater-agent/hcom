@@ -177,6 +177,69 @@ pub struct PreparedDelivery {
     pub ack: super::DeliveryAck,
 }
 
+/// Options for [`assemble_gemini_family_lifecycle_outputs`].
+pub(crate) struct GeminiFamilyLifecycleOpts {
+    /// BeforeAgent only: return wake-only context when agy has no pending messages.
+    pub allow_wake_no_pending: bool,
+}
+
+/// Combined lifecycle hook text + optional deferred ack / early wake-only return.
+pub(crate) struct GeminiFamilyLifecycleOutput {
+    pub parts: Vec<String>,
+    pub delivery_ack: Option<super::DeliveryAck>,
+    pub early_wake_context: Option<String>,
+}
+
+/// Shared beforeagent/aftertool output assembly for Gemini and Antigravity.
+pub(crate) fn assemble_gemini_family_lifecycle_outputs(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    instance: &InstanceRow,
+    is_agy: bool,
+    opts: GeminiFamilyLifecycleOpts,
+) -> GeminiFamilyLifecycleOutput {
+    let instance_name = &instance.name;
+    let mut parts: Vec<String> = Vec::new();
+    let mut delivery_ack = None;
+
+    if is_agy {
+        if let Some(prepared) = prepare_pending_messages(db, instance_name) {
+            parts.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
+            parts.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else if opts.allow_wake_no_pending && instance.name_announced != 0 {
+            return GeminiFamilyLifecycleOutput {
+                parts: vec![],
+                delivery_ack: None,
+                early_wake_context: Some(bootstrap::ANTIGRAVITY_WAKE_NO_PENDING.to_string()),
+            };
+        }
+        if let Some(bootstrap) =
+            inject_bootstrap_once(db, ctx, instance_name, instance, &instance.tool)
+        {
+            parts.push(bootstrap);
+        }
+    } else {
+        if let Some(bootstrap) =
+            inject_bootstrap_once(db, ctx, instance_name, instance, &instance.tool)
+        {
+            parts.push(bootstrap);
+        }
+        if let Some(prepared) = prepare_pending_messages(db, instance_name) {
+            parts.push(prepared.formatted);
+            delivery_ack = Some(prepared.ack);
+        } else {
+            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        }
+    }
+
+    GeminiFamilyLifecycleOutput {
+        parts,
+        delivery_ack,
+        early_wake_context: None,
+    }
+}
+
 pub(crate) fn limit_delivery_messages(messages: &[Value]) -> Vec<Value> {
     if messages.len() > MAX_MESSAGES_PER_DELIVERY {
         messages[..MAX_MESSAGES_PER_DELIVERY].to_vec()
@@ -1186,6 +1249,93 @@ fn stop_instance_inner(
     }
 }
 
+/// Soft session end for Antigravity: keep `instances` row for `hcom r` / @mention resume path.
+///
+/// Clears session/process bindings and logs a stopped life event with snapshot,
+/// but does not delete the instance row (PTY cleanup skips `delete_instance` when inactive).
+pub fn soft_finalize_session(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) {
+    log::log_info(
+        "hooks",
+        "sessionend.soft",
+        &format!("instance={} reason={}", instance_name, reason),
+    );
+
+    lifecycle::set_status(
+        db,
+        instance_name,
+        ST_INACTIVE,
+        &format!("exit:{}", reason),
+        Default::default(),
+    );
+
+    if let Some(updates) = updates {
+        instances::update_instance_position(db, instance_name, updates);
+    }
+
+    let instance_data = match db.get_instance_full(instance_name) {
+        Ok(Some(data)) => data,
+        _ => return,
+    };
+
+    let snapshot = serde_json::json!({
+        "name": instance_name,
+        "transcript_path": instance_data.transcript_path,
+        "session_id": instance_data.session_id,
+        "tool": instance_data.tool,
+        "directory": instance_data.directory,
+        "parent_name": instance_data.parent_name,
+        "tag": instance_data.tag,
+        "wait_timeout": instance_data.wait_timeout,
+        "subagent_timeout": instance_data.subagent_timeout,
+        "hints": instance_data.hints,
+        "pid": instance_data.pid,
+        "created_at": instance_data.created_at,
+        "background": instance_data.background,
+        "agent_id": instance_data.agent_id,
+        "launch_args": instance_data.launch_args,
+        "origin_device_id": instance_data.origin_device_id,
+        "background_log_file": instance_data.background_log_file,
+        "last_event_id": instance_data.last_event_id,
+    });
+
+    if let Some(ref session_id) = instance_data.session_id {
+        let _ = db.conn().execute(
+            "DELETE FROM session_bindings WHERE session_id = ?",
+            params![session_id],
+        );
+        let _ = db.conn().execute(
+            "DELETE FROM process_bindings WHERE session_id = ?",
+            params![session_id],
+        );
+    }
+
+    let _ = db.delete_notify_endpoints(instance_name);
+    let _ = db.conn().execute(
+        "DELETE FROM process_bindings WHERE instance_name = ?",
+        params![instance_name],
+    );
+    let _ = db.cleanup_subscriptions(instance_name);
+
+    if let Err(e) = db.log_life_event(
+        instance_name,
+        "stopped",
+        "session",
+        &format!("exit:{}", reason),
+        Some(snapshot),
+    ) {
+        log::log_warn(
+            "hooks",
+            "sessionend.soft.life_event_failed",
+            &format!("log_life_event failed for {instance_name}: {e}"),
+        );
+    }
+}
+
 /// Set inactive status, persist updates, and stop instance.
 ///
 /// Common to Claude and Gemini SessionEnd handlers. Catches all errors
@@ -1815,6 +1965,42 @@ mod tests {
             db.get_session_binding("sess-fresh").unwrap(),
             None,
             "fresh session must not get bound via stale marker"
+        );
+    }
+
+    #[test]
+    fn soft_finalize_session_keeps_instance_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id)
+                 VALUES ('vine', 'listening', ?1, 'antigravity', 'sess-soft-1')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-soft-1', 'vine', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        soft_finalize_session(&db, "vine", "unknown", None);
+
+        assert!(db.get_instance_full("vine").unwrap().is_some());
+        let status = db.get_status("vine").unwrap().map(|(s, _)| s);
+        assert_eq!(status.as_deref(), Some(ST_INACTIVE));
+        assert_eq!(db.get_session_binding("sess-soft-1").unwrap(), None);
+        assert_eq!(
+            db.find_stopped_instance_by_session_id("sess-soft-1")
+                .unwrap()
+                .as_deref(),
+            Some("vine")
         );
     }
 }

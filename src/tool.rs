@@ -50,6 +50,7 @@ pub enum Tool {
     Gemini,
     Codex,
     OpenCode,
+    Antigravity,
     Adhoc,
 }
 
@@ -69,6 +70,7 @@ impl Tool {
             // Gates delivery thread startup so PTY bootstrap inject doesn't fire
             // into a blank screen before the input box exists.
             Tool::OpenCode => b"ctrl+p commands",
+            Tool::Antigravity => b"? for shortcuts",
             Tool::Adhoc => b"",
         }
     }
@@ -82,6 +84,7 @@ impl Tool {
             Tool::Gemini => "gemini",
             Tool::Codex => "codex",
             Tool::OpenCode => "opencode",
+            Tool::Antigravity => "antigravity",
             Tool::Adhoc => "adhoc",
         }
     }
@@ -93,6 +96,7 @@ impl Tool {
             Tool::Gemini => GEMINI_HOOKS,
             Tool::Codex => CODEX_HOOKS,
             Tool::OpenCode => OPENCODE_HOOKS,
+            Tool::Antigravity => GEMINI_HOOKS,
             Tool::Adhoc => &[],
         }
     }
@@ -103,6 +107,10 @@ impl Tool {
     }
 
     /// Resolve the tool that owns a hook command name.
+    ///
+    /// Antigravity is intentionally excluded: it reuses Gemini hook command names
+    /// (`gemini-sessionstart`, etc.) and is identified via `ANTIGRAVITY_AGENT` in
+    /// `HcomContext`, not hook-name routing.
     pub fn from_hook_name(name: &str) -> Option<Self> {
         [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode]
             .into_iter()
@@ -124,6 +132,7 @@ impl FromStr for Tool {
             "gemini" => Ok(Tool::Gemini),
             "codex" => Ok(Tool::Codex),
             "opencode" => Ok(Tool::OpenCode),
+            "antigravity" | "agy" => Ok(Tool::Antigravity),
             "adhoc" => Ok(Tool::Adhoc),
             _ => Err(format!("Unknown tool: {}", s)),
         }
@@ -149,6 +158,7 @@ mod tests {
 
     #[test]
     fn hook_names_are_disjoint() {
+        // Antigravity shares GEMINI_HOOKS — excluded so gemini-* names stay owned by Gemini.
         let mut owners = HashMap::new();
         for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
             for hook in tool.hooks() {
@@ -160,5 +170,30 @@ mod tests {
                 assert_eq!(Tool::from_hook_name(hook), Some(tool));
             }
         }
+    }
+
+    #[test]
+    fn antigravity_as_str() {
+        assert_eq!(Tool::Antigravity.as_str(), "antigravity");
+    }
+
+    #[test]
+    fn antigravity_from_str() {
+        assert_eq!("antigravity".parse::<Tool>(), Ok(Tool::Antigravity));
+    }
+
+    #[test]
+    fn antigravity_agy_alias() {
+        assert_eq!("agy".parse::<Tool>(), Ok(Tool::Antigravity));
+    }
+
+    #[test]
+    fn antigravity_ready_pattern() {
+        assert_eq!(Tool::Antigravity.ready_pattern(), b"? for shortcuts");
+    }
+
+    #[test]
+    fn antigravity_shares_gemini_hooks() {
+        assert_eq!(Tool::Antigravity.hooks(), Tool::Gemini.hooks());
     }
 }

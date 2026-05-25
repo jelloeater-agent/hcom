@@ -26,6 +26,7 @@ mod events;
 mod instances;
 mod kv;
 mod notify;
+pub(crate) mod reqwatch_policy;
 mod sessions;
 pub(crate) mod subscriptions;
 
