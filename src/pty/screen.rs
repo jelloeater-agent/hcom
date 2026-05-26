@@ -243,16 +243,26 @@ impl ScreenTracker {
     /// Antigravity-specific approval detection: the agy TUI renders permission
     /// prompts as plain text in the prompt area ("Requesting permission for: …"
     /// with a "1. Yes / 4. No" menu). No OSC9 fires, so scrape the screen.
+    /// Requires both the marker and either the question or the control footer
+    /// to avoid flipping on stray occurrences of the marker in scrollback.
     pub fn is_antigravity_approval_visible(&self) -> bool {
-        const APPROVAL_MARKER: &str = "Requesting permission for:";
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
+        let mut has_marker = false;
+        let mut has_question = false;
+        let mut has_footer = false;
         for line in screen.rows(0, cols) {
-            if line.contains(APPROVAL_MARKER) {
-                return true;
+            if line.contains("Requesting permission for:") {
+                has_marker = true;
+            }
+            if line.contains("Do you want to proceed?") {
+                has_question = true;
+            }
+            if line.contains("tab Amend") && line.contains("edit command") {
+                has_footer = true;
             }
         }
-        false
+        has_marker && (has_question || has_footer)
     }
 
     /// Check if output has been stable for N milliseconds
@@ -879,6 +889,22 @@ mod tests {
         let mut t = make_tracker(24, 80, "");
         t.process(b"> hello world\r\nrunning hcom list\r\n");
         assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_marker_alone_does_not_trigger() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"agent said: Requesting permission for: something earlier\r\n> idle\r\n");
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_via_control_footer() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(
+            b"Requesting permission for: rm -rf /tmp/x\r\n  1. Yes\r\n  2. No\r\n  tab Amend . e edit command\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
     }
 
     // ---- Codex input extraction ----
