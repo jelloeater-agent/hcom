@@ -649,13 +649,7 @@ fn drive_launch_outcome(
             if launch_ready_observed(config, state) {
                 emit_launch_ready_once(db, state, current_name, launch_outcome);
             } else {
-                maybe_emit_launch_blocked(
-                    db,
-                    state,
-                    current_name,
-                    current_status,
-                    launch_outcome,
-                );
+                maybe_emit_launch_blocked(db, state, current_name, current_status, launch_outcome);
             }
         }
         LaunchOutcome::Blocked => {
