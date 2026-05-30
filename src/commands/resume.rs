@@ -1017,8 +1017,12 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
 ///     itself (snapshot dir or `--dir`), so a stale `--workspace` would fight
 ///     the recovered cwd and `--worktree` would spawn a *new* worktree.
 ///
-/// Resume args (`--resume <session_id>` + any user-supplied extra args) are
-/// prepended; preserved original flags follow.
+/// Resume args (`--resume <session_id>` + any user-supplied extra args) come
+/// first; preserved original flags follow. For **singular** flags that the
+/// resume args already specify (e.g. a resume-time `--model x`), the baked
+/// original copy is dropped so the resume value wins under commander.js
+/// last-wins — matching claude/codex/gemini precedence. **Repeatable** flags
+/// (`-H`/`--header`, `--plugin-dir`) are always kept and concatenate.
 fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
     // Flags whose following token is a value (so it isn't mistaken for the
     // positional prompt). `--resume`/`--worktree` also accept a value but are
@@ -1043,9 +1047,29 @@ fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--worktree-base",
     ];
     const DROP_BOOLEAN: &[&str] = &["--continue", "--skip-worktree-setup"];
+    // Repeatable flags concatenate across resume + original, so they're never
+    // deduped (long names lowercased; `-H` matched case-sensitively below).
+    const REPEATABLE: &[&str] = &["--header", "--plugin-dir"];
 
     let is_flag = |t: &str| t.starts_with('-');
     let header_flags = ["-H"]; // cursor's repeatable header short flag takes a value
+    let is_repeatable = |token: &str, bare: &str| REPEATABLE.contains(&bare) || token == "-H";
+
+    // Singular flag base-names already present in the resume args — the baked
+    // original copy of any of these is dropped so resume wins (consistency with
+    // the other tools' resume-precedence). Repeatables are excluded.
+    let mut resume_singular_flags = std::collections::HashSet::new();
+    for token in resume {
+        if !is_flag(token) {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+        if is_repeatable(token, &bare) {
+            continue;
+        }
+        resume_singular_flags.insert(bare);
+    }
 
     let mut preserved = Vec::new();
     let mut i = 0;
@@ -1068,11 +1092,18 @@ fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
             }
             continue;
         }
+        // Resume already specifies this singular flag → drop the baked dup
+        // (and its value token, when split form) so resume wins.
+        let deduped = !is_repeatable(token, bare) && resume_singular_flags.contains(bare);
         let takes_value = VALUE_FLAGS.contains(&bare) || header_flags.contains(&token.as_str());
         if takes_value {
-            preserved.push(token.clone());
+            if !deduped {
+                preserved.push(token.clone());
+            }
             if !token.contains('=') && i + 1 < original.len() {
-                preserved.push(original[i + 1].clone());
+                if !deduped {
+                    preserved.push(original[i + 1].clone());
+                }
                 i += 2;
             } else {
                 i += 1;
@@ -1081,8 +1112,10 @@ fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
         }
         if is_flag(token) {
             // Unknown/boolean config flag (e.g. --force, --yolo, --plan,
-            // --approve-mcps, --trust, --stream-partial-output): preserve.
-            preserved.push(token.clone());
+            // --approve-mcps, --trust): preserve unless resume overrides it.
+            if !deduped {
+                preserved.push(token.clone());
+            }
             i += 1;
             continue;
         }
@@ -1092,7 +1125,9 @@ fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
 
     let mut merged = resume.to_vec();
     merged.extend(preserved);
-    merged
+    // Defensive: never let a baked/resume-time --print drop cursor into one-shot
+    // headless mode (no beforeSubmitPrompt/stop hooks → broken delivery).
+    crate::tools::cursor_preprocessing::strip_cursor_print_flags(&merged)
 }
 
 /// Merge agy original args with resume args.
@@ -1942,6 +1977,53 @@ mod tests {
             merged,
             s(&["--resume", "sid", "--model=sonnet-4", "-H", "X-Trace: 1"])
         );
+    }
+
+    /// Precedence: a resume-time `--model x` must beat the baked `--model y`.
+    /// The baked singular copy is dropped (resume wins), while repeatable
+    /// flags from both sides concatenate.
+    #[test]
+    fn test_merge_resume_args_cursor_resume_value_beats_baked() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&["--model", "y", "-H", "X-Baked: 1", "--force", "stale task"]),
+            &s(&["--resume", "sid", "--model", "x", "-H", "X-Resume: 1"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "sid",
+                "--model",
+                "x",
+                "-H",
+                "X-Resume: 1",
+                // baked --model y dropped (resume wins); -H kept (repeatable);
+                // --force preserved.
+                "-H",
+                "X-Baked: 1",
+                "--force",
+            ])
+        );
+    }
+
+    /// Defensive print-strip: a baked `--print`/`-p`/`--stream-partial-output`
+    /// (e.g. from a stray HCOM_CURSOR_ARGS) must be stripped on resume so the
+    /// relaunch stays in PTY mode where delivery hooks fire.
+    #[test]
+    fn test_merge_resume_args_cursor_strips_print_flags() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "-p",
+                "--print",
+                "--stream-partial-output",
+                "--model",
+                "composer-2.5",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(merged, s(&["--resume", "sid", "--model", "composer-2.5"]));
     }
 
     #[test]

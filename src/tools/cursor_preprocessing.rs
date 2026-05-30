@@ -26,6 +26,28 @@ pub(crate) fn cursor_project_slug(workspace: &Path) -> String {
         .join("-")
 }
 
+/// Print/headless flags that would break hcom's PTY delivery model.
+///
+/// hcom always runs cursor-agent inside a PTY (interactive, or HeadlessPty for
+/// background) — never `--print`. The `beforeSubmitPrompt`/`stop` hooks that
+/// carry message delivery do **not** fire in `--print` mode, so a stray
+/// `-p`/`--print` leaking in from `HCOM_CURSOR_ARGS` or a resumed instance's
+/// baked `launch_args` would silently break delivery. `--stream-partial-output`
+/// only works with `--print` + stream-json, so it's dead weight once `--print`
+/// is gone. All three are booleans (no value token), so a plain filter is safe.
+const CURSOR_PRINT_FLAGS: &[&str] = &["-p", "--print", "--stream-partial-output"];
+
+/// Strip print/headless flags from a cursor-agent arg list (see
+/// [`CURSOR_PRINT_FLAGS`]). Applied to both the launch-time arg merge and the
+/// resume merge so neither path can drop cursor into one-shot `--print` mode.
+pub(crate) fn strip_cursor_print_flags(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| !CURSOR_PRINT_FLAGS.contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn cursor_projects_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
@@ -80,6 +102,29 @@ mod tests {
         assert_eq!(
             cursor_project_slug(Path::new("/Users/anno/Dev/hook-comms-public")),
             "Users-anno-Dev-hook-comms-public"
+        );
+    }
+
+    #[test]
+    fn strip_cursor_print_flags_drops_print_and_companions_keeps_rest() {
+        let tokens: Vec<String> = [
+            "--model",
+            "composer-2.5",
+            "-p",
+            "--print",
+            "--stream-partial-output",
+            "--force",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            strip_cursor_print_flags(&tokens),
+            vec![
+                "--model".to_string(),
+                "composer-2.5".to_string(),
+                "--force".to_string()
+            ]
         );
     }
 }
