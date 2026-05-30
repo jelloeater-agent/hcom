@@ -992,11 +992,107 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         }
         "opencode" => merge_opencode_args(original, resume),
         "antigravity" => merge_antigravity_args(original, resume),
+        "cursor" => merge_cursor_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
         }
     }
+}
+
+/// Merge cursor-agent original launch args with resume args.
+///
+/// cursor's launch_args bake in `HCOM_CURSOR_ARGS` (e.g. `--model composer-2.5
+/// --force`) plus the trailing positional task prompt that the launcher appends
+/// (`launcher.rs` Positional shape). On resume we must:
+///   - preserve user config flags (`--model`, `--force`/`--yolo`, `--sandbox`,
+///     `--mode`/`--plan`, `--output-format`, `--api-key`, `-H`/`--header`,
+///     `--plugin-dir`, …) so the resumed agent keeps its model/permissions;
+///   - drop the stale positional prompt — re-submitting the original task on a
+///     resume would re-run it;
+///   - strip flags hcom owns at relaunch: prior session selectors
+///     (`--resume`/`--continue`) and cwd/worktree selectors
+///     (`--workspace`, `-w`/`--worktree`, `--worktree-base`,
+///     `--skip-worktree-setup`) — the launcher sets the working directory
+///     itself (snapshot dir or `--dir`), so a stale `--workspace` would fight
+///     the recovered cwd and `--worktree` would spawn a *new* worktree.
+///
+/// Resume args (`--resume <session_id>` + any user-supplied extra args) are
+/// prepended; preserved original flags follow.
+fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
+    // Flags whose following token is a value (so it isn't mistaken for the
+    // positional prompt). `--resume`/`--worktree` also accept a value but are
+    // stripped, so they're handled by DROP_WITH_VALUE below. The repeatable
+    // header short flag `-H` is handled separately (case-sensitive) because
+    // lowercasing collides with the `-h` help flag.
+    const VALUE_FLAGS: &[&str] = &[
+        "--api-key",
+        "--header",
+        "--output-format",
+        "--mode",
+        "--model",
+        "--sandbox",
+        "--plugin-dir",
+    ];
+    // Strip these flags (and their value/optional-value token when split form).
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--resume",
+        "--workspace",
+        "--worktree",
+        "-w",
+        "--worktree-base",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "--skip-worktree-setup"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+    let header_flags = ["-H"]; // cursor's repeatable header short flag takes a value
+
+    let mut preserved = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        let lower = token.to_lowercase();
+        let bare = lower.split('=').next().unwrap_or(&lower);
+
+        if DROP_BOOLEAN.contains(&bare) {
+            i += 1;
+            continue;
+        }
+        if DROP_WITH_VALUE.contains(&bare) {
+            // `--flag=value`: single token. Bare `--flag`: consume an optional
+            // following value only when it isn't itself a flag.
+            if !token.contains('=') && i + 1 < original.len() && !is_flag(&original[i + 1]) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let takes_value = VALUE_FLAGS.contains(&bare) || header_flags.contains(&token.as_str());
+        if takes_value {
+            preserved.push(token.clone());
+            if !token.contains('=') && i + 1 < original.len() {
+                preserved.push(original[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if is_flag(token) {
+            // Unknown/boolean config flag (e.g. --force, --yolo, --plan,
+            // --approve-mcps, --trust, --stream-partial-output): preserve.
+            preserved.push(token.clone());
+            i += 1;
+            continue;
+        }
+        // Bare positional = the stale task prompt. Drop it.
+        i += 1;
+    }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    merged
 }
 
 /// Merge agy original args with resume args.
@@ -1774,6 +1870,78 @@ mod tests {
             &s(&["--conversation", "new-id"]),
         );
         assert_eq!(merged, s(&["--conversation", "new-id", "--sandbox"]));
+    }
+
+    /// cursor launch_args bake in HCOM_CURSOR_ARGS config plus a trailing
+    /// positional prompt. Resume must preserve config flags, drop the stale
+    /// prompt + old --resume, and prepend the new resume args.
+    #[test]
+    fn test_merge_resume_args_cursor_preserves_config_drops_prompt_and_session() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--model",
+                "composer-2.5",
+                "--force",
+                "--resume",
+                "old-chat",
+                "fix the parser bug",
+            ]),
+            &s(&["--resume", "new-chat-id"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "new-chat-id",
+                "--model",
+                "composer-2.5",
+                "--force"
+            ])
+        );
+    }
+
+    /// cwd/worktree selectors are owned by the launcher (snapshot dir or --dir),
+    /// so a stale --workspace / -w must be stripped and not fight the recovered
+    /// cwd. --continue and the prompt are also dropped.
+    #[test]
+    fn test_merge_resume_args_cursor_strips_workspace_worktree_continue() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--workspace",
+                "/old/path",
+                "--continue",
+                "-w",
+                "feature-x",
+                "--sandbox",
+                "enabled",
+                "do the task",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(merged, s(&["--resume", "sid", "--sandbox", "enabled"]));
+    }
+
+    /// `--flag=value` form and the repeatable `-H` header value flag must be
+    /// preserved intact; the stale `--resume=old` equals-form is stripped.
+    #[test]
+    fn test_merge_resume_args_cursor_equals_form_and_header() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--model=sonnet-4",
+                "--resume=old",
+                "-H",
+                "X-Trace: 1",
+                "summarize",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--resume", "sid", "--model=sonnet-4", "-H", "X-Trace: 1"])
+        );
     }
 
     #[test]
