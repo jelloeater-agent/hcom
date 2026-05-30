@@ -549,10 +549,14 @@ pub fn dispatch_cursor_hook_native(hook_name: &str) -> i32 {
         return 0;
     }
     let payload = HookPayload::from_cursor_native(hook_name, raw);
+    // Fail-open panic fallback: `continue: true` guarantees a handler panic never
+    // blocks the user's prompt on beforeSubmitPrompt. The extra key is ignored by
+    // every other cursor hook (sessionStart accepts it explicitly; stop/sessionEnd/
+    // postToolUse/pretooluse ignore unknown output fields), so one fallback is safe.
     let (output, delivery_ack) = common::dispatch_with_panic_guard(
         "cursor",
         hook_name,
-        (json!({}), None),
+        (json!({ "continue": true }), None),
         || match hook_name {
             "cursor-sessionstart" => (handle_sessionstart(&db, &ctx, &payload), None),
             "cursor-beforesubmitprompt" => (handle_beforesubmitprompt(&db, &ctx, &payload), None),
