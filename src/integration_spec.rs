@@ -585,10 +585,14 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
         unique_examples: CURSOR_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // Empirically verified against real cursor transcripts: cursor's edit tool
+    // is `StrReplace` (not `Edit`, which never appears) and its file/edit tools
+    // key the path off `path` (not `file_path` — see extract_tool_detail). Shell
+    // also has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.
     status_detail: StatusDetailSpec {
-        bash: &["Shell"],
-        file: &["Write", "Edit"],
-        delegate: &["Task"],
+        bash: &["Shell", "run_terminal_cmd"],
+        file: &["Write", "StrReplace"],
+        delegate: &["Task", "Subagent"],
     },
 };
 

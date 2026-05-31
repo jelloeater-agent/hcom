@@ -1282,7 +1282,8 @@ impl Proxy {
             state.ready = self.screen.is_ready();
             state.approval = self.screen.is_waiting_approval()
                 || (self.config.tool == "antigravity"
-                    && self.screen.is_antigravity_approval_visible());
+                    && self.screen.is_antigravity_approval_visible())
+                || (self.config.tool == "cursor" && self.screen.is_cursor_approval_visible());
             let input_text = self.screen.get_input_box_text(&self.config.tool);
             let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
             // Stamp submit-edge cooldown when input transitions from a known

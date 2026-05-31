@@ -1376,11 +1376,12 @@ mod tests {
 
     #[test]
     fn detect_agent_type_cursor_keys_on_agent_transcripts_not_dotcursor() {
-        // Regression: a Claude transcript whose cwd-slug contains a checked-in
-        // `.cursor/` rules dir must NOT misroute to cursor (feeds resume tool
-        // detection → would break resume + pick the wrong parser).
+        // Regression: a Claude transcript path with a LITERAL `.cursor` segment
+        // (the CLAUDE_CONFIG_DIR-style vector the old `.contains(".cursor")`
+        // matcher WOULD have misrouted to cursor) must detect claude. Feeds
+        // resume tool detection → wrong match would break resume + parser.
         assert_eq!(
-            detect_agent_type("/home/u/.claude/projects/-repo--cursor-rules/abcd.jsonl"),
+            detect_agent_type("/home/u/.claude/projects/x/.cursor/abcd.jsonl"),
             "claude"
         );
         // A real cursor transcript (the `agent-transcripts` segment) detects cursor.

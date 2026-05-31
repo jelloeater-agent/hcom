@@ -265,6 +265,28 @@ impl ScreenTracker {
         has_marker && (has_question || has_footer)
     }
 
+    /// Cursor-specific approval detection: cursor renders a shell-command
+    /// permission prompt as plain text ("Run this command?" + a "Run (once) /
+    /// Add … to allowlist / Auto-run everything / Skip (esc or n)" menu). No
+    /// OSC9 fires, so scrape the screen. Require the question marker AND a menu
+    /// footer option so a stray "Run this command?" in scrollback can't flip it.
+    /// (File edits auto-apply by default and don't prompt — verified live.)
+    pub fn is_cursor_approval_visible(&self) -> bool {
+        let screen = self.parser.screen();
+        let (_rows, cols) = screen.size();
+        let mut has_question = false;
+        let mut has_footer = false;
+        for line in screen.rows(0, cols) {
+            if line.contains("Run this command?") {
+                has_question = true;
+            }
+            if line.contains("Auto-run everything") || line.contains("Skip (esc") {
+                has_footer = true;
+            }
+        }
+        has_question && has_footer
+    }
+
     /// Check if output has been stable for N milliseconds
     /// Note: ms=0 returns true (always stable), which is valid for tools that skip stability check
     pub fn is_output_stable(&self, ms: u64) -> bool {
@@ -930,6 +952,35 @@ mod tests {
             b"Requesting permission for: rm -rf /tmp/x\r\n  1. Yes\r\n  2. No\r\n  tab Amend . e edit command\r\n",
         );
         assert!(t.is_antigravity_approval_visible());
+    }
+
+    // ---- Cursor approval detection ----
+
+    #[test]
+    fn cursor_detects_approval_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        assert!(!t.is_cursor_approval_visible());
+        // Real cursor shell-approval menu (captured live).
+        t.process(
+            b"Run this command?\r\nNot in allowlist: uptime\r\n  Run (once) (y)\r\n  Auto-run everything (shift+tab)\r\n  Skip (esc or n)\r\n",
+        );
+        assert!(t.is_cursor_approval_visible());
+    }
+
+    #[test]
+    fn cursor_question_alone_does_not_trigger() {
+        // The question text in narration/scrollback without the menu footer
+        // must not flip approval on.
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"I'll ask: Run this command? then proceed.\r\n> idle\r\n");
+        assert!(!t.is_cursor_approval_visible());
+    }
+
+    #[test]
+    fn cursor_no_false_positive_without_question() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"> hello world\r\nrunning a build\r\n");
+        assert!(!t.is_cursor_approval_visible());
     }
 
     // ---- Codex input extraction ----

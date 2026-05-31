@@ -29,7 +29,8 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
     if detail.file.contains(&tool_name) {
         return tool_input
             .get("file_path")
-            .or_else(|| tool_input.get("TargetFile"))
+            .or_else(|| tool_input.get("TargetFile")) // antigravity
+            .or_else(|| tool_input.get("path")) // cursor (Write/StrReplace)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -204,6 +205,44 @@ mod tests {
             extract_tool_detail("gemini", "delegate_to_agent", &input2),
             "do something"
         );
+    }
+
+    #[test]
+    fn test_extract_tool_detail_cursor() {
+        // Shell command (and the run_terminal_cmd variant) → command field.
+        let shell = serde_json::json!({"command": "cargo build", "description": "build"});
+        assert_eq!(
+            extract_tool_detail("cursor", "Shell", &shell),
+            "cargo build"
+        );
+        assert_eq!(
+            extract_tool_detail("cursor", "run_terminal_cmd", &shell),
+            "cargo build"
+        );
+        // Edit (StrReplace) and Write → `path` field (cursor uses `path`, not file_path).
+        let edit =
+            serde_json::json!({"path": "/src/main.rs", "old_string": "a", "new_string": "b"});
+        assert_eq!(
+            extract_tool_detail("cursor", "StrReplace", &edit),
+            "/src/main.rs"
+        );
+        let write = serde_json::json!({"path": "/src/lib.rs", "contents": "x"});
+        assert_eq!(
+            extract_tool_detail("cursor", "Write", &write),
+            "/src/lib.rs"
+        );
+        // Delegate (Task/Subagent) → prompt field.
+        let task = serde_json::json!({"prompt": "explore the codebase", "subagent_type": "x"});
+        assert_eq!(
+            extract_tool_detail("cursor", "Task", &task),
+            "explore the codebase"
+        );
+        assert_eq!(
+            extract_tool_detail("cursor", "Subagent", &task),
+            "explore the codebase"
+        );
+        // `Edit` is a Claude tool name, never emitted by cursor → no detail.
+        assert_eq!(extract_tool_detail("cursor", "Edit", &edit), "");
     }
 
     #[test]
