@@ -207,6 +207,9 @@ pub(crate) fn assemble_gemini_family_lifecycle_outputs(
     let mut delivery_ack = None;
 
     if is_agy {
+        // agy gets one short anti-stall preamble before each delivery (see
+        // ANTIGRAVITY_DELIVERY_ACTION). On an empty wake it gets nothing and
+        // simply ends its turn — no discovery prompt is needed.
         if let Some(prepared) = prepare_pending_messages(db, instance_name) {
             parts.push(bootstrap::ANTIGRAVITY_DELIVERY_ACTION.to_string());
             parts.push(prepared.formatted);
@@ -215,7 +218,7 @@ pub(crate) fn assemble_gemini_family_lifecycle_outputs(
             return GeminiFamilyLifecycleOutput {
                 parts: vec![],
                 delivery_ack: None,
-                early_wake_context: Some(bootstrap::ANTIGRAVITY_WAKE_NO_PENDING.to_string()),
+                early_wake_context: None,
             };
         }
         if let Some(bootstrap) =
