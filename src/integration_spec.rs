@@ -579,6 +579,10 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     },
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
+        // O2: cursor-agent has no native fork/branch primitive (only `--resume`
+        // / `--continue` / `create-chat`). Leave `fork: None` like gemini/agy;
+        // simulating fork via resume+create-chat is deferred (not needed for
+        // parity).
         fork: None,
     }),
     help: HelpSpec {
