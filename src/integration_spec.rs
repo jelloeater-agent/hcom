@@ -287,9 +287,9 @@ const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
 ];
 
 const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom cursor --model sonnet-4", "Use a specific model"),
+    ("hcom cursor-agent --model sonnet-4", "Use a specific model"),
     (
-        "hcom cursor --force",
+        "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
     ),
 ];

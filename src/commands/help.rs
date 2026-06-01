@@ -667,11 +667,13 @@ fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::Integra
 
 /// Generate tool launch help from the integration spec.
 fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String {
-    // The CLI uses "agy" rather than the canonical "antigravity" for Antigravity.
-    let t = if spec.tool == crate::tool::Tool::Antigravity {
-        "agy"
-    } else {
-        spec.name
+    // The displayed launch keyword can differ from the canonical internal
+    // `spec.name`: Antigravity launches as "agy", Cursor as "cursor-agent"
+    // (the real CLI binary — there is no `cursor` command to pass through to).
+    let t = match spec.tool {
+        crate::tool::Tool::Antigravity => "agy",
+        crate::tool::Tool::Cursor => "cursor-agent",
+        _ => spec.name,
     };
     let inside_ai = crate::shared::is_inside_ai_tool();
     let term_desc = if inside_ai {
@@ -862,7 +864,7 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode|agy|cursor [flags] [tool-args]\n\
+  hcom [N] claude|gemini|codex|opencode|agy|cursor-agent [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
   hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\

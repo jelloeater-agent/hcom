@@ -6,7 +6,7 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode and Antigravity without changing how you use them.
+`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, Antigravity and Cursor without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -43,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode / agy
+hcom claude   # codex / gemini / opencode / agy / cursor-agent
 ```
 
 Terminal 2:
@@ -217,6 +217,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Codex CLI | automatic | `hcom codex` |
 | Antigravity CLI | automatic | `hcom agy` |
 | OpenCode | automatic | `hcom opencode` |
+| Cursor CLI | automatic | `hcom cursor-agent` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -249,7 +250,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|agy|opencode   # launch N agents
+hcom [N] claude|gemini|codex|agy|opencode|cursor-agent   # launch N agents
 hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
@@ -312,7 +313,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `cursor_args` | Default args passed to the tool |
 
 ### Scope
 

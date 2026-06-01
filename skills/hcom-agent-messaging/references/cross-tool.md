@@ -45,6 +45,17 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Message delivery**: Plugin TCP endpoint
 - **Auto-approval**: `OPENCODE_PERMISSION={"bash":{"hcom *":"allow"}}` env var
 
+### Cursor (cursor-agent)
+- **Hooks**: sessionStart, beforeSubmitPrompt, preToolUse, postToolUse, stop, sessionEnd
+- **Payload**: JSON via stdin
+- **Session binding**: On sessionStart hook, immediate
+- **Message delivery**: Hook-based when hcom-launched. Active turn → body in postToolUse `additional_context`. Idle agent → a sentinel turn whose `stop` hook carries the body in `followup_message` (one extra turn vs. other tools — the idle wake costs a round-trip).
+- **Background mode**: HeadlessPty — runs under a PTY even when headless (cursor-agent `--print` drops the beforeSubmitPrompt + stop hooks, so hcom keeps the interactive TUI). No detached `--print` background like Claude.
+- **Approval handling**: cursor's interactive approval prompt ("Run this command?") is detected by PTY screen scrape; a message held at an approval surfaces status `blocked: approval pending`.
+- **Status detail**: edit tool is `StrReplace` (not `Edit`); file/edit tools key the path off `path` (not `file_path`); shell has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.
+- **Fork**: not supported (cursor-agent has no native branch primitive — only `--resume`/`--continue`); resume preserved.
+- **Transcript**: cursor stores history in a protobuf+JSON store.db (no JSONL for hcom launches); parser support is limited.
+
 ## Working Patterns
 
 See `scripts/cross-tool-duo.sh` for Claude architect + Codex engineer, and `scripts/codex-worker.sh` for Codex coder + Claude reviewer. See `patterns.md` for all 6 tested patterns including Claude + Gemini mixed perspectives.
