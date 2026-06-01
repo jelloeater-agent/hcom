@@ -108,29 +108,12 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 // call for no benefit.  "End your turn" short-circuits that impulse and lets
 // the hook machinery do the work.
 
-const ANTIGRAVITY_DELIVERY: &str = r#"## ANTIGRAVITY DELIVERY (hook-primary)
-
-Antigravity delivers hcom messages through hooks, not only the prompt line:
-- `<hcom>…</hcom>` in the prompt is a **preview** (sender + snippet). The full message body is injected into your context at the start of this turn (before the model is called). Read both; act on the delivery block first.
-- On a prompt that is only `<hcom>`: do **not** run `hcom --help`, `hcom list`, `hcom listen`, `hcom events`, `ListDir`, `Read`, or git/status on the hcom repo unless the delivery below tells you to.
-- When a delivery has `intent=request`: your **first** tool call must be `hcom send @{SENDER} ...` — no exploration first.
-- After `hcom send`, end your turn so the next delivery can arrive.
-
-Messages still arrive automatically — end your turn to receive them."#;
-
-/// Prepended above the JSON delivery block on agy hook turns with unread messages.
-pub(crate) const ANTIGRAVITY_DELIVERY_ACTION: &str = r#"## HCOM MESSAGE — act on this block now
-
-The `<hcom>…</hcom>` line in the terminal is a preview only. Instructions and the full message JSON are below.
-Forbidden on this turn unless the message asks: `hcom --help`, `hcom list`, `hcom listen`, repo tours, ListDir/Read of hcom or bookkeeping/.
-For `intent=request`: first tool call must be `hcom send @{sender} ...`, then end your turn."#;
-
-/// Shown when agy was woken with `<hcom>` but there are no unread messages (e.g. still waiting on a peer).
-pub(crate) const ANTIGRAVITY_WAKE_NO_PENDING: &str = r#"## HCOM wake (no new messages)
-
-You were woken by `<hcom>` but there is no new hcom delivery for you right now.
-Do not run discovery commands (`hcom --help`, `hcom list`, `hcom listen`, repo reads).
-End your turn and wait — a reply will arrive on a later `<hcom>` wake when the peer sends."#;
+/// Prepended above the JSON delivery block on agy hook turns with unread
+/// messages. Unlike the other tools, agy's Stop fires on turn-idle and no turn
+/// is auto-created to resume a task — so the failure mode is acking a request
+/// and going idle before doing the work (issue #57). This line guards that.
+pub(crate) const ANTIGRAVITY_DELIVERY_ACTION: &str = r#"## HCOM MESSAGE — handle the delivery below this turn
+For `intent=request`: an ACK alone does not complete it, and no turn is auto-created to resume after you go idle. Do the requested work and `hcom send` the result in this same turn. Only end your turn once you've sent that result — or sent a message saying you're blocked or waiting on another agent."#;
 
 pub(crate) fn is_antigravity_tool(tool: &str) -> bool {
     tool == "antigravity"
@@ -447,15 +430,15 @@ pub fn get_bootstrap(
         parts.push(UVX_CMD_NOTICE);
     }
 
-    // Tool-specific delivery
-    if tool == "antigravity" && ctx.is_launched {
-        parts.push(DELIVERY_AUTO);
-        parts.push(ANTIGRAVITY_DELIVERY);
-    } else if tool == "cursor" && ctx.is_launched {
+    // Tool-specific delivery. cursor adds wake-trigger guidance; antigravity
+    // shares the auto-delivery section and gets its turn-specific
+    // ANTIGRAVITY_DELIVERY_ACTION preamble from the hook layer.
+    if tool == "cursor" && ctx.is_launched {
         parts.push(DELIVERY_AUTO);
         parts.push(CURSOR_DELIVERY);
     } else if tool == "claude"
-        || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
+        || ((tool == "codex" || tool == "gemini" || tool == "opencode" || tool == "antigravity")
+            && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
     } else {
@@ -798,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_bootstrap_antigravity_launched_gets_hook_primary_delivery() {
+    fn test_get_bootstrap_antigravity_launched_gets_auto_delivery() {
         let (tmp, db) = setup_test_db();
 
         let result = get_bootstrap(
@@ -814,17 +797,18 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("ANTIGRAVITY DELIVERY"));
-        assert!(result.contains("preview"));
-        assert!(result.contains("hcom --help"));
+        // agy uses the same auto-delivery section as the other managed tools.
         assert!(result.contains("Messages instantly and automatically arrive"));
+        assert!(result.contains("hcom <command> --help"));
     }
 
     #[test]
-    fn test_antigravity_delivery_action_forbids_discovery() {
+    fn test_antigravity_delivery_action_guards_against_ack_only_stall() {
+        // The per-turn preamble must tell agy that an ACK alone doesn't finish a
+        // request and that no turn is auto-created to resume after it goes idle.
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
-        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("hcom --help"));
-        assert!(ANTIGRAVITY_WAKE_NO_PENDING.contains("no new messages"));
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("ACK alone does not complete"));
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("no turn is auto-created"));
     }
 
     #[test]
