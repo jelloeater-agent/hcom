@@ -557,6 +557,19 @@ impl HcomDb {
         }
         let tx = self.conn.unchecked_transaction()?;
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
+            if next_version == 17 {
+                let has_launch_context = tx
+                    .prepare("PRAGMA table_info(instances)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .any(|col| col == "launch_context");
+                if !has_launch_context {
+                    tx.execute(
+                        "ALTER TABLE instances ADD COLUMN launch_context TEXT DEFAULT ''",
+                        [],
+                    )?;
+                }
+            }
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
                 return Ok(false);
             };
