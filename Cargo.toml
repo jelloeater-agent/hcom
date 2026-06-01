@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "0.7.19"
+version = "0.7.20"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, and Kilo Code so agents can message, watch, and spawn each other across terminals"
