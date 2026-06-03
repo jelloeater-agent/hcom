@@ -680,3 +680,114 @@ fn cursor_e2e_hook_dispatch() {
         "delivered context should carry the message text: {injected:?}"
     );
 }
+
+/// End-to-end GitHub Copilot CLI native hook lifecycle over JSON-on-stdin.
+///
+/// Mirrors `cursor_e2e_hook_dispatch` but exercises copilot's real payload shape
+/// (`session_id`/`tool_name`/`tool_input`/`tool_result`, Claude-style `command`
+/// hooks). Copilot's `SessionStart` returns `additionalContext`/`{}` (no `env`
+/// block), `PostToolUse` injects pending messages via `additionalContext` and
+/// acks delivery. Reuses `run_cursor_hook` — it is a generic "pipe JSON to a
+/// native hook" runner, not cursor-specific.
+#[test]
+fn copilot_e2e_hook_dispatch() {
+    let h = Hcom::new();
+    let transcript = tempfile::NamedTempFile::new().expect("temp transcript");
+    let transcript_path = transcript.path().to_string_lossy().to_string();
+    let pid = "pid-cop-123";
+    let session_id = "sess-cop-1";
+
+    // Register a process binding so the hooks can resolve an instance.
+    let mut start_cmd = h.cmd();
+    start_cmd.arg("start");
+    start_cmd.env("HCOM_PROCESS_ID", pid);
+    let start_out = start_cmd.output().expect("failed to run hcom start");
+    let me = support::parse_hcom_marker(&String::from_utf8_lossy(&start_out.stdout))
+        .expect("no [hcom:NAME] marker");
+
+    // 1. SessionStart binds the session to the active instance.
+    let _ = run_cursor_hook(
+        &h,
+        "copilot-sessionstart",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": "/tmp",
+        }),
+    );
+
+    // Binding is visible via list --json.
+    let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    assert_eq!(v["session_id"].as_str(), Some(session_id));
+
+    // 2. UserPromptSubmit marks the instance active and returns an empty object.
+    let prompt_submit = run_cursor_hook(
+        &h,
+        "copilot-userpromptsubmit",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "prompt": "do a thing",
+        }),
+    );
+    assert_eq!(prompt_submit, serde_json::json!({}));
+
+    let (code, stdout, _) = h.run(["list", &me, "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
+    assert_eq!(v["status"].as_str(), Some("active"));
+
+    // 3. PreToolUse records tool status and returns an empty object.
+    let pre_tool = run_cursor_hook(
+        &h,
+        "copilot-pretooluse",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "tool_name": "bash",
+            "tool_input": { "command": "echo hello" },
+        }),
+    );
+    assert_eq!(pre_tool, serde_json::json!({}));
+
+    // 4. Queue a message from an external sender, then PostToolUse delivers it
+    //    via additionalContext. (Self-addressed sends are dropped by the DB
+    //    delivery filter, so the assertion below would pass vacuously.)
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--from",
+        "bigboss",
+        &format!("@{me}"),
+        "--intent",
+        "request",
+        "--",
+        "ping",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+
+    let post_tool = run_cursor_hook(
+        &h,
+        "copilot-posttooluse",
+        pid,
+        &serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "tool_name": "bash",
+            "tool_input": { "command": "echo hello" },
+            "tool_result": { "text_result_for_llm": "hello" },
+        }),
+    );
+    let injected = post_tool
+        .get("additionalContext")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("PostToolUse should inject additionalContext: {post_tool}"));
+    assert!(
+        injected.contains("ping"),
+        "delivered context should carry the message text: {injected:?}"
+    );
+}

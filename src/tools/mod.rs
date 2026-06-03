@@ -7,6 +7,7 @@
 pub mod args_common;
 pub mod codex_args;
 pub mod codex_preprocessing;
+pub mod copilot_preprocessing;
 pub mod cursor_preprocessing;
 pub mod gemini_args;
 pub mod opencode_preprocessing;

@@ -55,6 +55,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 ///   opencode: `--prompt "prompt"`
 ///   antigravity: `--prompt-interactive "prompt"` (agy's documented interactive flag)
 ///   cursor: bare positional
+///   copilot: `-i "prompt"`
 ///
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
@@ -86,6 +87,9 @@ pub fn build_launch_argv(
                     argv.push("-p".into());
                 }
                 argv.push(prompt.into());
+            }
+            Tool::Copilot => {
+                argv.extend(["-i".into(), prompt.into()]);
             }
             Tool::Gemini => {
                 // gemini uses -i for initial prompt; headless not supported
@@ -246,6 +250,23 @@ mod tests {
                 "--no-run-here",
                 "--terminal",
                 "tmux",
+                "do task"
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_argv_copilot_prompt_uses_interactive_flag() {
+        let argv = build_launch_argv(Tool::Copilot, 1, "", false, "tmux", "do task");
+        assert_eq!(
+            argv,
+            vec![
+                "1",
+                "copilot",
+                "--no-run-here",
+                "--terminal",
+                "tmux",
+                "-i",
                 "do task"
             ]
         );

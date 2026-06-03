@@ -5,9 +5,9 @@
 //!
 //! Requires:
 //! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
-//! - Target tool CLI installed (claude/gemini/codex/opencode/cursor)
+//! - Target tool CLI installed (claude/gemini/codex/opencode/cursor/copilot)
 //!
-//! Phases (claude/gemini/codex/antigravity/cursor):
+//! Phases (claude/gemini/codex/antigravity/cursor/copilot):
 //! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
 //! 2. Wait for ready event, capture and validate full screen state
 //! 3. Send message → verify delivery via events, capture post-delivery screen
@@ -83,6 +83,7 @@ fn ready_pattern(tool: &str) -> &'static str {
         // prompt_empty directly. has_ready_pattern() gates the pattern check off
         // for cursor so it isn't run vacuously against an empty needle.
         "cursor" => "",
+        "copilot" => "/ commands",
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -95,6 +96,7 @@ fn prompt_marker(tool: &str) -> &'static str {
         "gemini" => " > ",
         "antigravity" => ">",
         "cursor" => "→",
+        "copilot" => "❯",
         _ => panic!("No prompt marker for {tool}"),
     }
 }
@@ -107,6 +109,7 @@ fn frame_marker(tool: &str) -> Option<&'static str> {
         "gemini" => None,
         "antigravity" => Some("─"),
         "cursor" => None,
+        "copilot" => None,
         _ => None,
     }
 }
@@ -122,6 +125,7 @@ fn gate_block_context(tool: &str) -> &'static str {
         // prompt_has_text (may transiently report user-active first; validate
         // only warns on mismatch).
         "cursor" => "tui:prompt-has-text",
+        "copilot" => "tui:prompt-has-text",
         _ => panic!("No gate block context for {tool}"),
     }
 }
@@ -145,7 +149,8 @@ fn require_ready(tool: &str) -> bool {
 /// requires the real `deliver:` event, not merely the injected trigger.
 fn clean_prompt_delivery_timeout(tool: &str) -> Duration {
     match tool {
-        "cursor" => Duration::from_secs(60),
+        // Turn-bounded delivery: agentStop/followup_message fires at end of a full model turn
+        "cursor" | "copilot" => Duration::from_secs(60),
         _ => Duration::from_secs(20),
     }
 }
@@ -682,6 +687,7 @@ fn run_pty_test(tool: &str) {
         // `auto` is the only model guaranteed to launch across cursor plan tiers
         // (named models error on free plans).
         "cursor" => " --model auto",
+        // copilot: no flag — its default model is probably cheap.
         _ => "",
     };
     let out = hcom(&format!("--go 1 {tool}{model_flag}"));
@@ -1427,4 +1433,10 @@ fn test_pty_antigravity() {
 #[ignore]
 fn test_pty_cursor() {
     run_pty_test("cursor");
+}
+
+#[test]
+#[ignore]
+fn test_pty_copilot() {
+    run_pty_test("copilot");
 }

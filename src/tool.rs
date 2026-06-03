@@ -19,6 +19,7 @@ pub enum Tool {
     Antigravity,
     Cursor,
     Kimi,
+    Copilot,
     Adhoc,
 }
 
@@ -97,6 +98,9 @@ impl Tool {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
+            Tool::Copilot => {
+                crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
+            }
             Tool::Adhoc => false,
         }
     }
@@ -129,6 +133,8 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
+            Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -150,6 +156,7 @@ impl Tool {
             Tool::Antigravity => Ok(crate::hooks::antigravity::remove_antigravity_hooks()),
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
+            Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
             Tool::Adhoc => Ok(false),
         }
     }
@@ -166,6 +173,7 @@ impl Tool {
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
+            Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()
@@ -220,6 +228,7 @@ mod tests {
             Tool::Codex,
             Tool::OpenCode,
             Tool::Cursor,
+            Tool::Copilot,
         ] {
             for hook in tool.hooks() {
                 assert_eq!(
@@ -260,6 +269,11 @@ mod tests {
     #[test]
     fn antigravity_ready_pattern() {
         assert_eq!(Tool::Antigravity.ready_pattern(), b"? for shortcuts");
+    }
+
+    #[test]
+    fn copilot_from_alias() {
+        assert_eq!("copilot".parse::<Tool>(), Ok(Tool::Copilot));
     }
 
     #[test]

@@ -246,6 +246,42 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_detail_copilot() {
+        // Shell (bash/powershell) → command field.
+        let shell = serde_json::json!({"command": "cargo build"});
+        assert_eq!(
+            extract_tool_detail("copilot", "bash", &shell),
+            "cargo build"
+        );
+        assert_eq!(
+            extract_tool_detail("copilot", "powershell", &shell),
+            "cargo build"
+        );
+        // File tools (create/edit/apply_patch) → `path` field (copilot uses `path`).
+        let edit = serde_json::json!({"path": "/src/main.rs"});
+        assert_eq!(
+            extract_tool_detail("copilot", "edit", &edit),
+            "/src/main.rs"
+        );
+        assert_eq!(
+            extract_tool_detail("copilot", "create", &edit),
+            "/src/main.rs"
+        );
+        assert_eq!(
+            extract_tool_detail("copilot", "apply_patch", &edit),
+            "/src/main.rs"
+        );
+        // Delegate (task) → prompt field.
+        let task = serde_json::json!({"prompt": "explore the codebase"});
+        assert_eq!(
+            extract_tool_detail("copilot", "task", &task),
+            "explore the codebase"
+        );
+        // Claude-style names are never emitted by copilot → no detail.
+        assert_eq!(extract_tool_detail("copilot", "Bash", &shell), "");
+    }
+
+    #[test]
     fn test_extract_tool_detail_unknown() {
         let input = serde_json::json!({"command": "ls"});
         assert_eq!(extract_tool_detail("claude", "UnknownTool", &input), "");

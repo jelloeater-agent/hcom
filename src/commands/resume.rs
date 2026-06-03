@@ -1002,6 +1002,87 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
     }
 }
 
+/// Merge copilot original launch args with resume args.
+///
+/// copilot launch_args bake in `HCOM_COPILOT_ARGS` (e.g. `--model
+/// claude-haiku-4.5`) plus the `-i <initial-prompt>` from the launcher.
+/// On resume: drop `-i`/`--interactive` and its value, drop `--resume`
+/// and its value; keep everything else (model flags, `--allow-*`, etc.).
+/// Resume args take precedence for overlapping singular flags.
+fn merge_copilot_args(original: &[String], resume: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &["--model", "--name", "--add-dir", "--agent"];
+    const DROP_WITH_VALUE: &[&str] = &["--resume", "-i", "--interactive"];
+    const DROP_BOOLEAN: &[&str] = &["--allow-all-tools", "--allow-all", "--yolo"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+
+    // Singular flags already present in resume args — original copies are dropped.
+    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_next = false;
+    for token in resume {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+            if VALUE_FLAGS.contains(&bare.as_str()) {
+                skip_next = true;
+            }
+            if !DROP_WITH_VALUE.contains(&bare.as_str()) {
+                resume_flags.insert(bare);
+            }
+        }
+    }
+
+    // Filter the original args.
+    let mut filtered_original: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
+                (lower[..pos].to_string(), true)
+            } else {
+                (lower.clone(), false)
+            };
+            if DROP_WITH_VALUE.contains(&bare.as_str()) {
+                i += 1;
+                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            if DROP_BOOLEAN.contains(&bare.as_str()) {
+                i += 1;
+                continue;
+            }
+            if resume_flags.contains(&bare) {
+                i += 1;
+                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            filtered_original.push(token.clone());
+            i += 1;
+            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                filtered_original.push(original[i].clone());
+                i += 1;
+            }
+        } else {
+            // Skip bare positional values (e.g. the `-i` prompt that was split off).
+            i += 1;
+        }
+    }
+
+    let mut result = resume.to_vec();
+    result.extend(filtered_original);
+    result
+}
+
 /// Merge cursor-agent original launch args with resume args.
 ///
 /// cursor's launch_args bake in `HCOM_CURSOR_ARGS` (e.g. `--model composer-2.5
@@ -1651,6 +1732,28 @@ fn derive_cursor_transcript_path(session_id: &str) -> Option<String> {
     None
 }
 
+/// Locate a Copilot CLI transcript by session UUID.
+/// Copilot stores transcripts at `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
+/// where `COPILOT_HOME` defaults to `~/.copilot`.
+fn derive_copilot_transcript_path(session_id: &str) -> Option<String> {
+    let copilot_home = if let Ok(dir) = std::env::var("COPILOT_HOME")
+        && !dir.is_empty()
+    {
+        std::path::PathBuf::from(dir)
+    } else {
+        dirs::home_dir()?.join(".copilot")
+    };
+    let candidate = copilot_home
+        .join("session-state")
+        .join(session_id)
+        .join("events.jsonl");
+    if candidate.exists() {
+        Some(candidate.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
 /// cursor transcripts carry no `cwd`, so recover it from the per-workspace
 /// `.workspace-trusted` marker cursor writes at
 /// `~/.cursor/projects/<slug>/.workspace-trusted` (`workspacePath` field). The
@@ -1694,6 +1797,8 @@ fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
 ///   match against `projectHash` to recover the original CWD.
 /// - **Cursor**: the transcript has no `cwd`; recover it from the sibling
 ///   `~/.cursor/projects/<slug>/.workspace-trusted` marker (`workspacePath`).
+/// - **Copilot**: `session.start` entry carries `cwd` in the `data` object;
+///   scan the first few lines for it.
 fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     match tool {
         "claude" => scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str())),
@@ -2851,6 +2956,61 @@ mod tests {
         }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
+    }
+
+    #[test]
+    fn test_build_resume_args_copilot() {
+        let args = build_resume_args("copilot", "sess-abc", false);
+        assert_eq!(args, s(&["--resume", "sess-abc"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_copilot_fork_rejected() {
+        // copilot has fork: None, so build_resume_args returns resume-only args
+        let args = build_resume_args("copilot", "sess-abc", true);
+        assert_eq!(args, s(&["--resume", "sess-abc"]));
+    }
+
+    #[test]
+    fn test_merge_copilot_args_preserves_model_drops_prompt() {
+        let original = s(&["--model", "claude-haiku-4.5", "-i", "do a task"]);
+        let resume = s(&["--resume", "sess-abc"]);
+        let merged = merge_resume_args("copilot", &original, &resume);
+        assert!(merged.contains(&"--resume".to_string()));
+        assert!(merged.contains(&"sess-abc".to_string()));
+        assert!(merged.contains(&"--model".to_string()));
+        assert!(merged.contains(&"claude-haiku-4.5".to_string()));
+        // Original -i prompt must be dropped
+        assert!(!merged.contains(&"-i".to_string()));
+        assert!(!merged.contains(&"do a task".to_string()));
+    }
+
+    #[test]
+    fn test_merge_copilot_args_resume_model_wins() {
+        let original = s(&["--model", "claude-haiku-4.5", "-i", "task"]);
+        let resume = s(&["--resume", "sess-abc", "--model", "claude-sonnet-4-5"]);
+        let merged = merge_resume_args("copilot", &original, &resume);
+        // Only one --model entry
+        assert_eq!(merged.iter().filter(|t| t.as_str() == "--model").count(), 1);
+        assert!(merged.contains(&"claude-sonnet-4-5".to_string()));
+        assert!(!merged.contains(&"claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_cwd_copilot_from_session_start() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"session.start","data":{"cwd":"/home/user/myproject","sessionId":"abc"}}"#,
+                "\n",
+                r#"{"type":"user.message","data":{"text":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), "copilot");
+        assert_eq!(cwd, Some("/home/user/myproject".to_string()));
     }
 
     #[test]

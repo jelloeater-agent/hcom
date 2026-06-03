@@ -6,6 +6,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod kimi;
@@ -32,6 +33,7 @@ pub enum ToolKind {
     OpenCode,
     Cursor,
     Kimi,
+    Copilot,
 }
 
 /// Options for reading a transcript.
@@ -69,6 +71,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
         ToolKind::Codex => codex::parse_codex_jsonl(path, opts.last, opts.detailed),
         ToolKind::Cursor => cursor::parse_cursor_jsonl(path, opts.last, opts.detailed),
         ToolKind::Kimi => kimi::parse_kimi_wire_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Copilot => copilot::parse_copilot_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -105,6 +108,8 @@ pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
         // cursor-unique `agent-transcripts` segment (not the `.jsonl` extension,
         // which is shared with Claude/Codex).
         Some(ToolKind::Cursor)
+    } else if path.contains("session-state") && path.ends_with("events.jsonl") {
+        Some(ToolKind::Copilot)
     } else {
         None
     }

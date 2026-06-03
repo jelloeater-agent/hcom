@@ -244,6 +244,20 @@ const KIMI_HOOKS: &[&str] = &[
     "kimi-notification",
 ];
 
+const COPILOT_HOOKS: &[&str] = &[
+    "copilot-sessionstart",
+    "copilot-userpromptsubmit",
+    "copilot-pretooluse",
+    "copilot-permissionrequest",
+    "copilot-posttooluse",
+    "copilot-posttoolusefailure",
+    "copilot-notification",
+    "copilot-agentstop",
+    "copilot-subagentstart",
+    "copilot-subagentstop",
+    "copilot-sessionend",
+];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -321,6 +335,17 @@ const KIMI_HELP_EXTRA_ENV: &[HelpEntry] = &[(
     "HCOM_KIMI_SYSTEM_PROMPT",
     "System prompt (env var or config)",
 )];
+
+const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom copilot --model claude-haiku-4.5",
+        "Use a specific model",
+    ),
+    (
+        "hcom copilot --allow-tool 'shell(hcom:*)'",
+        "Flags forwarded to copilot",
+    ),
+];
 
 // ── Per-tool integration constants ──────────────────────────────────────
 
@@ -735,6 +760,55 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static COPILOT: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Copilot,
+    name: "copilot",
+    label: "Copilot",
+    aliases: &[],
+    cli_binary: "copilot",
+    tui_prefix: "cop ",
+    adhoc_icon: None,
+    released: true,
+    // Copilot fires SessionStart twice: once at boot and again after it loads
+    // hooks/instructions. Gate on "/ commands" footer text so delivery doesn't
+    // inject during the loading window.
+    ready_pattern: b"/ commands",
+    hooks: HooksSpec {
+        names: COPILOT_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: true,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_COPILOT_ARGS"),
+        config_dir_env: Some("COPILOT_HOME"),
+        initial_prompt: InitialPromptShape::Flag("-i"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: COPILOT_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["bash", "powershell"],
+        file: &["create", "edit", "apply_patch"],
+        delegate: &["task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -791,6 +865,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &ANTIGRAVITY,
     &CURSOR,
     &KIMI,
+    &COPILOT,
     &ADHOC,
 ];
 
@@ -806,6 +881,7 @@ impl Tool {
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
+            Tool::Copilot => &COPILOT,
             Tool::Adhoc => &ADHOC,
         }
     }

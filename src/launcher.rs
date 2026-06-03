@@ -21,7 +21,9 @@ use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
 use crate::terminal;
-use crate::tools::{codex_preprocessing, cursor_preprocessing, opencode_preprocessing};
+use crate::tools::{
+    codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
+};
 
 /// Canonical tool types for launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,7 @@ pub enum LaunchTool {
     Antigravity,
     Cursor,
     Kimi,
+    Copilot,
 }
 
 impl LaunchTool {
@@ -50,6 +53,7 @@ impl LaunchTool {
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
+            "copilot" => Ok(LaunchTool::Copilot),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -65,6 +69,7 @@ impl LaunchTool {
             LaunchTool::Antigravity => "antigravity",
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
+            LaunchTool::Copilot => "copilot",
         }
     }
 
@@ -82,6 +87,7 @@ impl LaunchTool {
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
+            LaunchTool::Copilot => crate::tool::Tool::Copilot,
         }
     }
 
@@ -147,7 +153,8 @@ impl LaunchBackend {
             | LaunchTool::Kilo
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
-            | LaunchTool::Kimi => LaunchBackend::HeadlessPty,
+            | LaunchTool::Kimi
+            | LaunchTool::Copilot => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -266,6 +273,24 @@ pub fn build_launch_env(hcom_config: &HcomConfig) -> HashMap<String, String> {
     }
 
     env
+}
+
+fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
+    let root = crate::runtime_env::tool_config_root();
+    if dirs::home_dir().as_deref() == Some(root.as_path()) {
+        return None;
+    }
+    let dirname = match tool.tool() {
+        crate::tool::Tool::Claude => ".claude",
+        crate::tool::Tool::Gemini | crate::tool::Tool::Antigravity => ".gemini",
+        crate::tool::Tool::Codex => ".codex",
+        crate::tool::Tool::Kilo => ".kilo",
+        crate::tool::Tool::Cursor => ".cursor",
+        crate::tool::Tool::Kimi => ".kimi",
+        crate::tool::Tool::Copilot => ".copilot",
+        crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
+    };
+    Some(root.join(dirname))
 }
 
 /// Get system prompt file path for Gemini/Codex.
@@ -491,6 +516,23 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
                 bail!(
                     "Failed to setup Kimi hooks: {e}\n\
                      Run: hcom hooks add kimi\n\
+                     {diag}"
+                );
+            }
+            Ok(())
+        }
+        LaunchTool::Copilot => {
+            if crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions) {
+                return Ok(());
+            }
+            if let Err(e) = crate::hooks::copilot::try_setup_copilot_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[("hooks_path", crate::hooks::copilot::get_copilot_hooks_path())],
+                );
+                bail!(
+                    "Failed to setup Copilot hooks: {e}\n\
+                     Run: hcom hooks add copilot\n\
                      {diag}"
                 );
             }
@@ -1008,6 +1050,19 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.extend(caller_env.clone());
     }
     base_env.remove("HCOM_TERMINAL");
+    if let Some(env_var) = normalized.spec().launch.config_dir_env
+        && !base_env.contains_key(env_var)
+        && std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_none()
+        && let Some(config_dir) = isolated_tool_config_dir(&normalized)
+    {
+        base_env.insert(
+            env_var.to_string(),
+            config_dir.to_string_lossy().to_string(),
+        );
+    }
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1045,13 +1100,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     let working_dir = params.cwd.as_deref().unwrap_or(".");
     let canonical_dir = std::fs::canonicalize(working_dir)
         .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
-    // Folder trust is a first-run gate: until the launch dir is trusted, the tool
-    // parks on a "do you trust this folder?" prompt and never starts. Pre-grant
-    // trust for the dir the user pointed hcom at. Cursor's lever is a marker file
-    // (its `--trust` flag is print-only, inert in our PTY), so it's seeded here;
+    // Folder trust: on first run each tool shows a "do you trust this folder?"
+    // prompt — the user accepts to continue or declines and it exits. When an
+    // agent launches another agent via hcom, auto-approve the prompt for the
+    // launch dir to smooth the process. Cursor's lever is a marker file (its
+    // `--trust` flag is print-only, inert in our PTY), so it's seeded here;
     // gemini/codex use arg injection below.
     if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Cursor) {
         cursor_preprocessing::ensure_cursor_workspace_trusted(&canonical_dir)?;
+    }
+    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Copilot) {
+        copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
     inject_workspace_trust_args(
         &normalized,
@@ -1589,6 +1648,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Copilot => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "copilot",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -1691,6 +1777,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
         LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
         LaunchTool::Kimi => Vec::new(),
         LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Antigravity => Vec::new(),
+        LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
     }
 }
 
@@ -1742,6 +1829,10 @@ mod tests {
             LaunchTool::from_str("agy", false).unwrap(),
             LaunchTool::Antigravity
         );
+        assert_eq!(
+            LaunchTool::from_str("copilot", false).unwrap(),
+            LaunchTool::Copilot
+        );
         assert!(LaunchTool::from_str("unknown", false).is_err());
     }
 
@@ -1758,6 +1849,7 @@ mod tests {
         assert_eq!(LaunchTool::ClaudePty.as_str(), "claude-pty");
         assert_eq!(LaunchTool::Gemini.as_str(), "gemini");
         assert_eq!(LaunchTool::Antigravity.as_str(), "antigravity");
+        assert_eq!(LaunchTool::Copilot.as_str(), "copilot");
     }
 
     #[test]
@@ -1766,6 +1858,7 @@ mod tests {
         assert_eq!(LaunchTool::ClaudePty.base_tool(), "claude");
         assert_eq!(LaunchTool::Codex.base_tool(), "codex");
         assert_eq!(LaunchTool::Antigravity.base_tool(), "antigravity");
+        assert_eq!(LaunchTool::Copilot.base_tool(), "copilot");
     }
 
     #[test]
@@ -1776,6 +1869,7 @@ mod tests {
         assert!(LaunchTool::Codex.uses_pty());
         assert!(LaunchTool::OpenCode.uses_pty());
         assert!(LaunchTool::Kilo.uses_pty());
+        assert!(LaunchTool::Copilot.uses_pty());
     }
 
     #[test]
@@ -1789,6 +1883,7 @@ mod tests {
             LaunchTool::OpenCode,
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
+            LaunchTool::Copilot,
         ] {
             let pty = tool.uses_pty();
             assert_eq!(
@@ -1827,6 +1922,7 @@ mod tests {
             LaunchTool::OpenCode,
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
+            LaunchTool::Copilot,
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true, true),

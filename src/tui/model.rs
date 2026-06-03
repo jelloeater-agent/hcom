@@ -85,6 +85,7 @@ pub enum Tool {
     Antigravity,
     Cursor,
     Kimi,
+    Copilot,
     Adhoc,
 }
 
@@ -100,6 +101,7 @@ impl Tool {
             Self::Antigravity => crate::tool::Tool::Antigravity,
             Self::Cursor => crate::tool::Tool::Cursor,
             Self::Kimi => crate::tool::Tool::Kimi,
+            Self::Copilot => crate::tool::Tool::Copilot,
             Self::Adhoc => crate::tool::Tool::Adhoc,
         }
     }
@@ -123,7 +125,8 @@ impl Tool {
             Self::Kilo => Self::Antigravity,
             Self::Antigravity => Self::Cursor,
             Self::Cursor => Self::Kimi,
-            Self::Kimi => Self::Claude,
+            Self::Kimi => Self::Copilot,
+            Self::Copilot => Self::Claude,
             Self::Adhoc => Self::Adhoc,
         }
     }
@@ -131,7 +134,7 @@ impl Tool {
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::Kimi,
+            Self::Claude => Self::Copilot,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
@@ -139,6 +142,7 @@ impl Tool {
             Self::Kilo => Self::OpenCode,
             Self::Cursor => Self::Antigravity,
             Self::Kimi => Self::Cursor,
+            Self::Copilot => Self::Kimi,
             Self::Adhoc => Self::Adhoc,
         }
     }

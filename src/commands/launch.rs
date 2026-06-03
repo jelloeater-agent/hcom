@@ -602,6 +602,16 @@ pub(crate) fn merge_tool_args(tool: &str, cli_args: &[String], config: &HcomConf
             tokens.extend(cli_args.iter().cloned());
             tokens
         }
+        "copilot" => {
+            let env_str = &config.copilot_args;
+            let mut tokens: Vec<String> = if env_str.is_empty() {
+                Vec::new()
+            } else {
+                crate::tools::args_common::shell_split(env_str).unwrap_or_default()
+            };
+            tokens.extend(cli_args.iter().cloned());
+            tokens
+        }
         _ => cli_args.to_vec(), // OpenCode-family tools: pass through
     }
 }

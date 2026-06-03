@@ -6,6 +6,7 @@ pub mod claude_args;
 pub mod codex;
 pub mod codex_file_edits;
 pub mod common;
+pub mod copilot;
 pub mod cursor;
 pub mod family;
 pub mod gemini;
@@ -44,6 +45,7 @@ pub mod test_helpers {
         saved_codex_home: Option<String>,
         saved_gemini_cli_home: Option<String>,
         saved_kilo_config_dir: Option<String>,
+        saved_copilot_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
@@ -67,6 +69,7 @@ pub mod test_helpers {
                 saved_codex_home: std::env::var("CODEX_HOME").ok(),
                 saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
                 saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
+                saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
                 _lock: lock,
             }
@@ -103,6 +106,10 @@ pub mod test_helpers {
                 match &self.saved_kilo_config_dir {
                     Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
                     None => std::env::remove_var("KILO_CONFIG_DIR"),
+                }
+                match &self.saved_copilot_home {
+                    Some(v) => std::env::set_var("COPILOT_HOME", v),
+                    None => std::env::remove_var("COPILOT_HOME"),
                 }
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
@@ -382,6 +389,48 @@ impl HookPayload {
         }
     }
 
+    /// Build from GitHub Copilot CLI native hook JSON.
+    ///
+    /// PascalCase hook names yield mostly snake_case payloads. `Notification`
+    /// is mixed-cased in current Copilot builds, so accept both styles.
+    pub fn from_copilot_native(hook_type: &str, raw: Value) -> Self {
+        let tool_result = raw
+            .get("tool_result")
+            .or_else(|| raw.get("toolResult"))
+            .and_then(|v| {
+                v.get("text_result_for_llm")
+                    .or_else(|| v.get("textResultForLlm"))
+                    .or_else(|| v.get("output"))
+                    .or_else(|| v.get("text"))
+                    .or(Some(v))
+            })
+            .map(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_default();
+
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id", "sessionId"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path", "transcriptPath"]),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name", "hookEventName"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "copilot".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name", "toolName"]),
+            tool_input: Self::obj_field(&raw, &["tool_input", "toolInput"]),
+            tool_result,
+            notification_type: Self::opt_str_field(
+                &raw,
+                &["notification_type", "notificationType"],
+            ),
+            raw,
+        }
+    }
+
     /// Build from OpenCode hook JSON.
     ///
     /// OpenCode hooks: session_id from env, minimal tool info.
@@ -542,6 +591,19 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("oc-111"));
         assert_eq!(payload.tool, "opencode");
         assert_eq!(payload.tool_name, "bash");
+    }
+
+    #[test]
+    fn test_hook_payload_from_copilot_mixed_notification() {
+        let raw = serde_json::json!({
+            "sessionId": "cop-1",
+            "hook_event_name": "Notification",
+            "notification_type": "agent_idle"
+        });
+        let payload = HookPayload::from_copilot_native("Notification", raw);
+        assert_eq!(payload.session_id.as_deref(), Some("cop-1"));
+        assert_eq!(payload.tool, "copilot");
+        assert_eq!(payload.notification_type.as_deref(), Some("agent_idle"));
     }
 
     #[test]

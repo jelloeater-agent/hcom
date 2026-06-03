@@ -395,6 +395,7 @@ impl ScreenTracker {
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),
+            Ok(Tool::Copilot) => self.get_copilot_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -742,6 +743,21 @@ impl ScreenTracker {
         None
     }
 
+    /// Extract GitHub Copilot CLI input text.
+    ///
+    /// Copilot uses `❯` as the prompt glyph and has no dim placeholder in the
+    /// empty state: an empty prompt is just a bare `❯` line.
+    fn get_copilot_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+        for line in lines.iter().rev() {
+            let trimmed = line.trim_start();
+            if let Some(text) = trimmed.strip_prefix('❯') {
+                return Some(trim_with_nbsp(text.trim_start()).to_string());
+            }
+        }
+        None
+    }
+
     /// Check and perform periodic dump if 5 seconds elapsed
     /// Returns true if dump was performed
     pub fn check_periodic_dump(&mut self, tool: &str, inject_port: u16, label: &str) -> bool {
@@ -804,6 +820,7 @@ impl ScreenTracker {
                     Ok(Tool::Gemini) => Some(">"),
                     Ok(Tool::Antigravity) => Some(">"),
                     Ok(Tool::Cursor) => Some("→"),
+                    Ok(Tool::Copilot) => Some("❯"),
                     _ => None,
                 };
                 if let Some(pc) = prompt_char {

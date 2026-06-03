@@ -1429,7 +1429,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Copilot auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1518,6 +1518,16 @@ HCOM_KILO_ARGS - Default args passed to kilo on launch
 
 Example: hcom config kilo_args \"--model kilo/kilo-auto/free\"
 Clear:   hcom config kilo_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_COPILOT_ARGS" => Some(
+            "\
+HCOM_COPILOT_ARGS - Default args passed to copilot on launch
+
+Example: hcom config copilot_args \"--model claude-haiku-4.5\"
+Clear:   hcom config copilot_args \"\"
 
 Prepended to launch-time cli args.",
         ),
@@ -2090,7 +2100,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Antigravity/Cursor/Copilot"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");

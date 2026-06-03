@@ -77,6 +77,44 @@ fn prompt_submit_observed(
     had_text && !has_text_now
 }
 
+/// Strip terminal focus in/out events (`CSI I` = `1b 5b 49`, `CSI O` = `1b 5b 4f`)
+/// from a forwarded stdin chunk. Returns `None` when there is nothing to strip,
+/// so the common keystroke path does not allocate.
+///
+/// GitHub Copilot CLI enables focus reporting (DECSET 1004) and *pauses draining
+/// its stdin on focus-out*. hcom drives copilot purely by injection, so once the
+/// pane is blurred that pause silently stalls message delivery until the user
+/// refocuses — and only a real terminal focus-in resumes it (an injected `CSI I`
+/// does not, because while paused copilot isn't reading stdin at all). Hiding
+/// focus events keeps copilot in its always-reading state, exactly like a pane
+/// that was never focused. Scoped to copilot at the call site.
+///
+/// Terminals emit these 3-byte events atomically, so a sequence split across
+/// reads is not tracked — it would pass through and cause at most one transient
+/// pause, self-corrected by the next focus event.
+fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
+    if !buf.contains(&0x1b) {
+        return None;
+    }
+    let mut found = false;
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b
+            && i + 2 < buf.len()
+            && buf[i + 1] == b'['
+            && matches!(buf[i + 2], b'I' | b'O')
+        {
+            found = true;
+            i += 3;
+            continue;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    found.then_some(out)
+}
+
 /// Check if data ends inside an incomplete escape sequence.
 ///
 /// Scans backwards for the last ESC (0x1b) and checks whether the escape
@@ -1040,7 +1078,17 @@ impl Proxy {
                                     state.approval = false;
                                 }
                             }
-                            write_all(&self.pty_master, &buf[..n])?;
+                            // Copilot pauses stdin processing on terminal focus-out
+                            // (it enables DECSET 1004). Since hcom drives it via
+                            // injection, that pause silently stalls delivery until the
+                            // pane is refocused — so hide focus events from it.
+                            if self.config.tool == "copilot"
+                                && let Some(filtered) = strip_focus_events(&buf[..n])
+                            {
+                                write_all(&self.pty_master, &filtered)?;
+                            } else {
+                                write_all(&self.pty_master, &buf[..n])?;
+                            }
                         }
                         Err(Errno::EAGAIN) => {}
                         Err(e) => bail!("read from stdin failed: {}", e),
@@ -1633,7 +1681,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_delivery_components, prompt_submit_observed};
+    use super::{initialize_delivery_components, prompt_submit_observed, strip_focus_events};
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;
@@ -1666,6 +1714,24 @@ mod tests {
     #[test]
     fn prompt_submit_observed_when_text_clears() {
         assert!(prompt_submit_observed(Some("run tests"), Some("")));
+    }
+
+    #[test]
+    fn strip_focus_events_removes_focus_in_and_out() {
+        assert_eq!(strip_focus_events(b"\x1b[O").unwrap(), b"");
+        assert_eq!(strip_focus_events(b"\x1b[I").unwrap(), b"");
+        // Embedded between real keystrokes.
+        assert_eq!(strip_focus_events(b"ab\x1b[Ocd").unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn strip_focus_events_passes_through_non_focus_input() {
+        // No ESC at all: nothing to strip (fast path returns None).
+        assert!(strip_focus_events(b"hello\r").is_none());
+        // Other escape sequences (arrow up = CSI A) must be preserved untouched.
+        assert!(strip_focus_events(b"\x1b[A").is_none());
+        // A trailing partial CSI is left intact (continuation handled by next read).
+        assert!(strip_focus_events(b"\x1b[").is_none());
     }
 
     #[test]

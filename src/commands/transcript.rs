@@ -135,6 +135,13 @@ pub(crate) fn detect_agent_type(path: &str) -> &str {
         "gemini"
     } else if lower.contains(".codex") || lower.contains("codex") {
         "codex"
+    } else if lower.contains(".copilot")
+        || (lower.contains("session-state") && lower.ends_with("events.jsonl"))
+    {
+        // Copilot transcripts: `~/.copilot/session-state/<uuid>/events.jsonl`.
+        // Require the `events.jsonl` tail so a bare `session-state` segment in an
+        // unrelated path can't misroute (mirrors `detect_kind_from_path`).
+        "copilot"
     } else if lower.contains("opencode") {
         "opencode"
     } else if lower.contains("kilo") {
@@ -1358,6 +1365,10 @@ mod tests {
         assert_eq!(
             detect_agent_type("/home/user/Library/Application Support/Antigravity/session.jsonl"),
             "antigravity"
+        );
+        assert_eq!(
+            detect_agent_type("/home/user/.copilot/session-state/abc/events.jsonl"),
+            "copilot"
         );
     }
 

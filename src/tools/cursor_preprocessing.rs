@@ -118,7 +118,7 @@ pub(crate) fn ensure_cursor_workspace_trusted(workspace: &Path) -> anyhow::Resul
         std::fs::create_dir_all(parent)?;
     }
     eprintln!(
-        "[hcom] Cursor Agent PTY hooks require a trusted workspace; recording trust for {} at {}",
+        "[hcom] Auto-approving Cursor Agent folder trust prompt for {} (marker: {})",
         normalized.display(),
         marker.display()
     );

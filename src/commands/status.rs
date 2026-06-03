@@ -78,6 +78,10 @@ fn check_cursor_hooks() -> bool {
     crate::hooks::cursor::verify_cursor_hooks_installed(false)
 }
 
+fn check_copilot_hooks() -> bool {
+    crate::hooks::copilot::verify_copilot_hooks_installed(false)
+}
+
 // ── Status Collection ────────────────────────────────────────────────────
 
 struct ToolStatus {
@@ -134,6 +138,11 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
             name: "Cursor",
             installed: crate::terminal::which_bin("cursor-agent").is_some(),
             hooks: check_cursor_hooks(),
+        },
+        ToolStatus {
+            name: "Copilot",
+            installed: crate::terminal::which_bin("copilot").is_some(),
+            hooks: check_copilot_hooks(),
         },
     ]
 }
