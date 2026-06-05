@@ -96,7 +96,19 @@ pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     // Generic terminal identity
     "TERM_PROGRAM",
     "TERM_SESSION_ID",
+];
+
+/// Terminal color/capability vars should come from the terminal/PTY that hosts
+/// the child. Forwarding a parent's `TERM=dumb`, test-harness `NO_COLOR`, or
+/// stale truecolor state into a new kitty pane can make otherwise-capable tools
+/// render in black and white.
+pub(crate) const TERMINAL_COLOR_VARS: &[&str] = &[
+    "TERM",
     "COLORTERM",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "FORCE_COLOR",
 ];
 
 /// Detect terminal preset from inherited environment variables.

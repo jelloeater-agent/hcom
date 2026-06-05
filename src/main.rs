@@ -30,6 +30,7 @@ pub mod router;
 mod runtime_env;
 pub mod scripts;
 pub mod shared;
+mod shell_env;
 pub mod terminal;
 mod tool;
 pub mod tools;
