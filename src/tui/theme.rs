@@ -31,6 +31,7 @@ pub mod palette {
     pub const MODE_COMPOSE: Color = Color::Rgb(52, 57, 83);
     pub const MODE_KILL: Color = Color::Rgb(58, 32, 42);
     pub const MODE_FORK: Color = Color::Rgb(32, 42, 66);
+    pub const MODE_RESUME: Color = Color::Rgb(34, 52, 39);
 }
 
 pub struct Theme;

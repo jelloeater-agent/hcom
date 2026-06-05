@@ -195,6 +195,40 @@ impl Agent {
         self.device_name.is_some()
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.status == AgentStatus::Inactive
+    }
+
+    pub fn can_kill(&self) -> bool {
+        !self.is_stopped()
+    }
+
+    pub fn can_resume(&self) -> bool {
+        self.is_stopped() && self.tool.spec().resume.is_some()
+    }
+
+    pub fn can_fork_from_tui(&self) -> bool {
+        !self.is_remote()
+            && !self.is_stopped()
+            && self
+                .tool
+                .spec()
+                .resume
+                .is_some_and(|resume| resume.fork.is_some())
+    }
+
+    pub fn can_tag(&self) -> bool {
+        true
+    }
+
+    pub fn action_name(&self) -> String {
+        if self.is_remote() {
+            self.display_name()
+        } else {
+            self.name.clone()
+        }
+    }
+
     pub fn context_display(&self) -> String {
         // Strip known internal prefixes for cleaner display
         let ctx = strip_context_prefix(&self.status_context);
@@ -372,6 +406,14 @@ pub enum CursorTarget {
     StoppedAgent(usize),
     OrphanHeader,
     Orphan(usize),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActionAvailability {
+    pub kill: bool,
+    pub fork: bool,
+    pub resume: bool,
+    pub tag: bool,
 }
 
 pub struct Flash {

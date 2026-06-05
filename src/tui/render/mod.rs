@@ -104,6 +104,7 @@ fn mode_input_bg(app: &App) -> ratatui::style::Color {
         return match &confirm.action {
             ConfirmAction::KillAgents(_) => palette::MODE_KILL,
             ConfirmAction::ForkAgents(_) => palette::MODE_FORK,
+            ConfirmAction::ResumeAgents(_) => palette::MODE_RESUME,
             _ => palette::SELECTION,
         };
     }
@@ -1190,16 +1191,23 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                         spans.push(dash);
                     }
 
-                    // Common action hints
+                    // Common action hints, filtered to actions that work for
+                    // the current cursor/selection.
+                    let actions = app.cursor_action_availability();
+                    spans.extend([Span::styled("m", hk), Span::styled(" message", hl)]);
+                    if actions.tag {
+                        spans.extend([Span::styled("  t", hk), Span::styled(" tag", hl)]);
+                    }
+                    if actions.resume {
+                        spans.extend([Span::styled("  r", hk), Span::styled(" resume", hl)]);
+                    }
+                    if actions.fork {
+                        spans.extend([Span::styled("  f", hk), Span::styled(" fork", hl)]);
+                    }
+                    if actions.kill {
+                        spans.extend([Span::styled("  k", hk), Span::styled(" kill", hl)]);
+                    }
                     spans.extend([
-                        Span::styled("m", hk),
-                        Span::styled(" message  ", hl),
-                        Span::styled("t", hk),
-                        Span::styled(" tag  ", hl),
-                        Span::styled("f", hk),
-                        Span::styled(" fork  ", hl),
-                        Span::styled("k", hk),
-                        Span::styled(" kill", hl),
                         gap.clone(),
                         Span::styled("/", hk),
                         Span::styled(" search  ", hl),
@@ -1266,6 +1274,7 @@ fn render_inline_confirm_input(confirm: &Confirm) -> Line<'static> {
     let (label, accent) = match &confirm.action {
         ConfirmAction::KillAgents(_) => ("KILL", palette::RED),
         ConfirmAction::ForkAgents(_) => ("FORK", palette::BLUE),
+        ConfirmAction::ResumeAgents(_) => ("RESUME", palette::GREEN),
         _ => ("CONFIRM", palette::YELLOW),
     };
     Line::from(vec![
@@ -1610,6 +1619,8 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm) {
         ConfirmAction::KillAgents(_) | ConfirmAction::KillOrphan(_) => " Kill ",
         ConfirmAction::ForkAgents(ref names) if names.len() > 1 => " Batch Fork ",
         ConfirmAction::ForkAgents(_) => " Fork ",
+        ConfirmAction::ResumeAgents(ref names) if names.len() > 1 => " Batch Resume ",
+        ConfirmAction::ResumeAgents(_) => " Resume ",
         ConfirmAction::OrphanAction(_) => " Orphan ",
     };
     let block = Block::default()

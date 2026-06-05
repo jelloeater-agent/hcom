@@ -286,6 +286,25 @@ impl App {
                 };
                 self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
             }
+            ConfirmAction::ResumeAgents(ref names) => {
+                for name in names {
+                    if let Err(e) = self.enqueue_rpc(RpcOp::Command {
+                        cmd: format!("r {}", name),
+                    }) {
+                        self.ui.flash = Some(Flash::new(
+                            format!("Resume failed: {}", e),
+                            Theme::flash_err(),
+                        ));
+                        return;
+                    }
+                }
+                let label = if names.len() == 1 {
+                    format!("Resuming {}", names[0])
+                } else {
+                    format!("Resuming {} agents", names.len())
+                };
+                self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
+            }
             ConfirmAction::KillOrphan(pid) => {
                 if !self.data.orphans.iter().any(|o| o.pid == pid) {
                     self.ui.flash = Some(Flash::new(

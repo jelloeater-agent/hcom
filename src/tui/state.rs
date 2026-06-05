@@ -133,7 +133,9 @@ impl Confirm {
     pub fn is_inline_agent_action(&self) -> bool {
         matches!(
             self.action,
-            ConfirmAction::KillAgents(_) | ConfirmAction::ForkAgents(_)
+            ConfirmAction::KillAgents(_)
+                | ConfirmAction::ForkAgents(_)
+                | ConfirmAction::ResumeAgents(_)
         )
     }
 }
@@ -141,6 +143,7 @@ impl Confirm {
 pub enum ConfirmAction {
     KillAgents(Vec<String>),
     ForkAgents(Vec<String>),
+    ResumeAgents(Vec<String>),
     KillOrphan(u32),
     /// Orphan chooser: selected=false → Kill, selected=true → Recover
     OrphanAction(u32),
