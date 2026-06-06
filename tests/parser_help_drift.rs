@@ -719,10 +719,9 @@ fn installed_kimi_help_crawls_and_hcom_keeps_kimi_args_append_only() {
         .iter()
         .map(|option| option.token.as_str())
         .collect::<BTreeSet<_>>();
-    for token in ["--session"] {
-        assert!(
-            root_option_tokens.contains(token),
-            "hcom observes Kimi launch arg {token}, but installed kimi root help does not list it"
-        );
-    }
+    let token = "--session";
+    assert!(
+        root_option_tokens.contains(token),
+        "hcom observes Kimi launch arg {token}, but installed kimi root help does not list it"
+    );
 }
