@@ -236,8 +236,86 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
         let mut sub_mut = sub.clone();
         if let Some(obj) = sub_mut.as_object_mut() {
             obj.remove("idle_grace_until");
+            obj.remove("idle_grace_event_id");
             kv_store_sub(db, &key, &sub_mut);
         }
+    }
+}
+
+/// Fire Antigravity request watches whose idle grace elapsed while no matching
+/// event arrived. The conditional delete is the claim: concurrent sweepers can
+/// observe the same row, but only one can remove it and emit the one-shot notice.
+fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
+    for (key, sub, filters) in load_reqwatch_subs(db) {
+        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity")
+            || !super::reqwatch_policy::idle_grace_expired(&sub, now)
+        {
+            continue;
+        }
+
+        let request_id = filters
+            .get("request_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let target = filters.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+        if request_id <= 0 || target.is_empty() || caller.is_empty() {
+            continue;
+        }
+
+        if reqwatch_reply_exists(db, request_id, target, caller) {
+            let _ = db.kv_set(&key, None);
+            continue;
+        }
+
+        let candidate_event_id = sub
+            .get("idle_grace_event_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| sub.get("last_id").and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+
+        let claimed = db
+            .conn()
+            .execute(
+                "DELETE FROM kv
+                 WHERE key = ?1
+                   AND CAST(json_extract(value, '$.idle_grace_until') AS REAL) <= ?2
+                   AND json_extract(value, '$.filters.target_tool') = 'antigravity'
+                   AND EXISTS (
+                       SELECT 1 FROM instances
+                       WHERE name = ?3 AND status = 'listening' AND last_event_id >= ?4
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM events_v
+                       WHERE id > ?4 AND type = 'message' AND msg_from = ?3
+                         AND (
+                             (msg_scope = 'mentions' AND EXISTS (
+                                 SELECT 1 FROM json_each(msg_delivered_to) WHERE value = ?5
+                             ))
+                             OR json_extract(data, '$.reply_to_local') = ?4
+                         )
+                   )",
+                params![key, now, target, request_id, caller],
+            )
+            .unwrap_or(0);
+        if claimed != 1 {
+            continue;
+        }
+
+        let sub_id = sub
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(key.as_str());
+        let notification = format_sub_notification(
+            db,
+            sub_id,
+            candidate_event_id,
+            "status",
+            target,
+            &serde_json::json!({"status": "listening"}),
+            Some(&filters),
+        );
+        let _ = send_sub_notification(db, caller, &notification);
     }
 }
 
@@ -583,6 +661,7 @@ pub(crate) fn process_logged_event(
                         if set_grace_if_absent {
                             sub_mut["idle_grace_until"] =
                                 serde_json::json!(now + AGY_REQWATCH_IDLE_GRACE_SEC);
+                            sub_mut["idle_grace_event_id"] = serde_json::json!(event_id);
                         }
                         kv_store_sub(db, key, &sub_mut);
                         continue;
@@ -658,6 +737,10 @@ pub(crate) fn process_logged_event(
             }
         }
     }
+
+    // A grace expiry is not itself an event. Sweep after handling the current
+    // event so replies, active/blocked transitions, and stop events win first.
+    sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64());
 }
 
 /// Load all reqwatch subscriptions as (key, parsed_sub, filters) tuples.
@@ -1277,6 +1360,127 @@ mod tests {
             sub.get("idle_grace_until").is_none(),
             "active should clear agy grace: {sub}"
         );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_expired_grace_sweep_notifies_exactly_once() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        db.set_status("nabe", "listening", "").unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+
+        let mut sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        sub["idle_grace_until"] = serde_json::json!(1.0);
+        kv_store_sub(&db, &sub_key, &sub);
+
+        sweep_expired_reqwatch_graces(&db, 2.0);
+        sweep_expired_reqwatch_graces(&db, 3.0);
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "expired grace should emit one abandoned-request notice"
+        );
+        assert!(
+            db.kv_get(&sub_key).unwrap().is_none(),
+            "one-shot reqwatch should be claimed and removed"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_reply_during_grace_cancels_expiry() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        db.set_status("nabe", "listening", "").unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "nabe",
+            &serde_json::json!({
+                "from": "nabe",
+                "sender_kind": "instance",
+                "scope": "mentions",
+                "text": "done",
+                "mentions": ["gora"],
+                "delivered_to": ["gora"],
+                "reply_to_local": request_id,
+            }),
+        )
+        .unwrap();
+
+        sweep_expired_reqwatch_graces(&db, f64::MAX);
+        assert!(db.kv_get(&sub_key).unwrap().is_none());
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "a reply during grace must suppress the idle notice"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_later_idle_spell_arms_fresh_grace() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+
+        db.set_status("nabe", "listening", "").unwrap();
+        let first_idle = db
+            .log_event(
+                "status",
+                "nabe",
+                &serde_json::json!({"status": "listening", "context": ""}),
+            )
+            .unwrap();
+
+        db.set_status("nabe", "blocked", "approval").unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "blocked", "context": "approval"}),
+        )
+        .unwrap();
+        let after_blocked: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        assert!(after_blocked.get("idle_grace_until").is_none());
+        assert!(after_blocked.get("idle_grace_event_id").is_none());
+
+        db.set_status("nabe", "listening", "").unwrap();
+        let second_idle = db
+            .log_event(
+                "status",
+                "nabe",
+                &serde_json::json!({"status": "listening", "context": ""}),
+            )
+            .unwrap();
+        let rearmed: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        assert_ne!(first_idle, second_idle);
+        assert_eq!(
+            rearmed.get("idle_grace_event_id").and_then(|v| v.as_i64()),
+            Some(second_idle),
+            "the later idle spell must own a fresh grace timer"
+        );
+        assert!(rearmed.get("idle_grace_until").is_some());
         cleanup_test_db(db_path);
     }
 

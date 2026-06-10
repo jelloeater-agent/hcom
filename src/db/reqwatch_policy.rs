@@ -7,6 +7,13 @@ use serde_json::Value;
 /// Per idle spell only — reset when the target goes `active`/`blocked` again.
 pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
 
+/// Whether a stored Antigravity idle grace is ready for timer/sweep handling.
+pub(crate) fn idle_grace_expired(sub: &Value, now: f64) -> bool {
+    sub.get("idle_grace_until")
+        .and_then(|v| v.as_f64())
+        .is_some_and(|until| now >= until)
+}
+
 /// How a request-watch subscription should react to a matching event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReqwatchNotifyDecision {
@@ -102,5 +109,14 @@ mod tests {
             reqwatch_notify_decision("antigravity", "status", &data, &sub, 0.0),
             ReqwatchNotifyDecision::Skip
         );
+    }
+
+    #[test]
+    fn test_idle_grace_expiry_is_inclusive() {
+        let sub = json!({"idle_grace_until": 50.0});
+        assert!(!idle_grace_expired(&sub, 49.999));
+        assert!(idle_grace_expired(&sub, 50.0));
+        assert!(idle_grace_expired(&sub, 51.0));
+        assert!(!idle_grace_expired(&json!({}), 100.0));
     }
 }
