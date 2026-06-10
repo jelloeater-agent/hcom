@@ -450,6 +450,63 @@ const TERMUX_CODEX_WRAPPER_PATH: &str = "/data/data/com.termux/files/usr/bin/cod
 const TERMUX_CODEX_INNER_WRAPPER_PATH: &str =
     "/data/data/com.termux/files/usr/lib/node_modules/@mmmbuto/codex-cli-termux/bin/codex";
 const TERMUX_SH_PATH: &str = "/data/data/com.termux/files/usr/bin/sh";
+const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
+
+/// Whether the host Termux installation is visible from this process.
+///
+/// This is intentionally broader than `is_native_termux_runtime()`: PRoot
+/// exposes host Termux paths and environment variables inside the distro.
+fn termux_host_visible() -> bool {
+    platform::is_termux()
+}
+
+fn native_termux_prefix() -> bool {
+    std::env::var("PREFIX")
+        .ok()
+        .is_some_and(|prefix| Path::new(&prefix) == Path::new(TERMUX_PREFIX))
+}
+
+fn proc_self_root_is_root() -> bool {
+    fs::read_link("/proc/self/root")
+        .is_ok_and(|root| root == Path::new("/"))
+}
+
+fn is_native_termux_runtime_from(
+    is_android_target: bool,
+    host_visible: bool,
+    has_native_prefix: bool,
+    self_root_is_root: bool,
+) -> bool {
+    is_android_target && host_visible && has_native_prefix && self_root_is_root
+}
+
+/// Whether this process can safely dispatch scripts into native Termux.
+fn is_native_termux_runtime() -> bool {
+    is_native_termux_runtime_from(
+        cfg!(target_os = "android"),
+        termux_host_visible(),
+        native_termux_prefix(),
+        proc_self_root_is_root(),
+    )
+}
+
+fn proot_termux_launch_error() -> &'static str {
+    "Cannot open a native Termux window from this PRoot runtime:\n\
+     the generated command uses PRoot paths and Linux/glibc binaries that cannot run\n\
+     in host Termux.\n\n\
+     Use one of:\n\
+       hcom <tool> --headless\n\
+       hcom <tool> --run-here\n\
+       hcom <tool> --terminal tmux"
+}
+
+fn validate_termux_dispatch_status(status: std::process::ExitStatus) -> Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Termux RUN_COMMAND dispatch failed: {status}")
+    }
+}
 
 /// Resolve Termux-only tool launch quirks.
 ///
@@ -461,7 +518,7 @@ pub fn resolve_termux_tool_launcher(
     tool_name: &str,
     resolved: &str,
 ) -> Option<(String, Vec<String>)> {
-    if !platform::is_termux() {
+    if !is_native_termux_runtime() {
         return None;
     }
 
@@ -1546,7 +1603,11 @@ pub fn launch_terminal(
         }
     } else {
         // Platform default
-        if platform::is_termux() {
+        if termux_host_visible() {
+            if !is_native_termux_runtime() {
+                bail!("{}", proot_termux_launch_error());
+            }
+
             let am_argv = vec![
                 "am",
                 "startservice",
@@ -1563,10 +1624,11 @@ pub fn launch_terminal(
                 "com.termux.RUN_COMMAND_BACKGROUND",
                 "false",
             ];
-            Command::new(am_argv[0])
+            let status = Command::new(am_argv[0])
                 .args(&am_argv[1..])
                 .status()
                 .context("Failed to launch Termux")?;
+            validate_termux_dispatch_status(status)?;
             return Ok((LaunchResult::Success, terminal_mode));
         }
 
@@ -1932,6 +1994,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_native_termux_runtime_requires_all_native_signals() {
+        assert!(is_native_termux_runtime_from(true, true, true, true));
+        assert!(!is_native_termux_runtime_from(false, true, true, true));
+        assert!(!is_native_termux_runtime_from(true, false, true, true));
+        assert!(!is_native_termux_runtime_from(true, true, false, true));
+        assert!(!is_native_termux_runtime_from(true, true, true, false));
+    }
+
+    #[test]
+    fn test_proot_termux_launch_error_is_actionable() {
+        let message = proot_termux_launch_error();
+        assert!(message.contains("--headless"));
+        assert!(message.contains("--run-here"));
+        assert!(message.contains("--terminal tmux"));
+    }
+
+    #[test]
+    fn test_termux_dispatch_rejects_nonzero_exit_status() {
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        let err = validate_termux_dispatch_status(status)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Termux RUN_COMMAND dispatch failed"));
     }
 
     #[test]
