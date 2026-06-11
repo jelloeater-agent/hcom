@@ -114,6 +114,9 @@ const VALUE_FLAGS: &[&str] = &[
     "--settings",
     "--system-prompt",
     "--system-prompt-file",
+    // Hidden Claude Code option; restores populated thinking summaries on
+    // models whose API default is `display: "omitted"`.
+    "--thinking-display",
     "--tools",
 ];
 
@@ -1095,6 +1098,16 @@ mod tests {
         let spec = resolve_claude_args(None, Some("--model sonnet --verbose"));
         assert_eq!(spec.get_flag_value("--model"), Some("sonnet".to_string()));
         assert!(spec.has_flag(&["--verbose"], &[]));
+    }
+
+    #[test]
+    fn test_resolve_hidden_thinking_display_from_env() {
+        let spec = resolve_claude_args(None, Some("--thinking-display summarized"));
+        assert!(!spec.has_errors());
+        assert_eq!(
+            spec.rebuild_tokens(true),
+            vec!["--thinking-display", "summarized"]
+        );
     }
 
     #[test]
