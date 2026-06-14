@@ -1209,16 +1209,19 @@ mod tests {
         .unwrap();
 
         let details = get_batch_failure_details_for_ids(&db, &["batch-456".to_string()]);
-        assert_eq!(
-            details,
-            vec!["mari: exited before binding (observed after 31s)".to_string()]
-        );
+        assert_eq!(details.len(), 1);
+        let detail = details[0]
+            .strip_prefix("mari: exited before binding (observed after ")
+            .and_then(|value| value.strip_suffix("s)"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("failure detail should include the observed age in seconds");
+        assert!(detail > crate::instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT);
 
         let stored = db.get_instance_full("mari").unwrap().unwrap();
         assert_eq!(stored.status_context, "launch_failed");
         assert_eq!(
             stored.status_detail,
-            "exited before binding (observed after 31s)"
+            details[0].strip_prefix("mari: ").unwrap()
         );
     }
 }

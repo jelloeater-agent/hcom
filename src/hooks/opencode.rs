@@ -934,8 +934,7 @@ mod tests {
     // ── Plugin management ──
 
     #[test]
-    fn test_plugin_source_not_empty() {
-        assert!(!PLUGIN_SOURCE.is_empty());
+    fn test_plugin_source_contains_entrypoint() {
         assert!(PLUGIN_SOURCE.contains("HcomPlugin"));
     }
 

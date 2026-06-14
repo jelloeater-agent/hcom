@@ -354,12 +354,10 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
 
     if killed == 0 && failed == 0 {
         println!("No processes with tracked PIDs found");
+    } else if failed > 0 {
+        println!("Killed {}, {} failed", killed, failed);
     } else {
-        if failed > 0 {
-            println!("Killed {}, {} failed", killed, failed);
-        } else {
-            println!("Killed {}", killed);
-        }
+        println!("Killed {}", killed);
     }
 
     Ok(if failed > 0 { 1 } else { 0 })
