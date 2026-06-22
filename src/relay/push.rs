@@ -14,6 +14,8 @@ use crate::log;
 use super::crypto;
 use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
 
+const RETAINED_EVENT_TAIL: i64 = 50;
+
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
 pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
@@ -116,6 +118,8 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
+    let tail_start_id = last_push_id.saturating_sub(RETAINED_EVENT_TAIL);
+
     let rows: Vec<(i64, String, String, String, String)> = db
         .conn()
         .prepare(
@@ -127,7 +131,7 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
         )
         .ok()
         .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![last_push_id], |row| {
+            stmt.query_map(rusqlite::params![tail_start_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -157,7 +161,9 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
             "instance": instance,
             "data": data,
         }));
-        max_id = max_id.max(*id);
+        if *id > last_push_id {
+            max_id = max_id.max(*id);
+        }
     }
 
     (state, events, max_id, has_more)
@@ -242,6 +248,8 @@ fn parse_iso_timestamp_to_epoch(ts: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::HcomDb;
+    use serde_json::json;
 
     #[test]
     fn test_parse_iso_timestamp_to_epoch() {
@@ -256,5 +264,35 @@ mod tests {
 
         // Invalid
         assert!(parse_iso_timestamp_to_epoch("not a date").is_none());
+    }
+
+    #[test]
+    fn build_push_payload_includes_recent_retained_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+
+        let old_id = db
+            .log_event("message", "old", &json!({"text": "old"}))
+            .unwrap();
+        let recent_id = db
+            .log_event("message", "recent", &json!({"text": "recent"}))
+            .unwrap();
+        safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
+
+        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a");
+
+        assert!(!has_more);
+        assert_eq!(max_id, recent_id);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["id"].as_i64() == Some(old_id)),
+            "retained snapshot should include recent already-pushed events"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["id"].as_i64() == Some(recent_id))
+        );
     }
 }

@@ -61,6 +61,8 @@ pub struct ScenarioIds {
     pub file_rel: String,
     /// Absolute path the shell tool must create with `initial` as its content.
     pub shell_path: String,
+    /// Workspace-relative form of `shell_path` for shell commands.
+    pub shell_rel: String,
     /// Shell command that sends the one outgoing hcom message.
     pub send_cmd: String,
 }
@@ -176,9 +178,20 @@ pub fn inject_prompt_until(
             }
             if accepted() {
                 let proof_deadline = Instant::now() + Duration::from_secs(40);
+                let mut last_approval_drive = Instant::now() - Duration::from_secs(10);
                 while Instant::now() < proof_deadline {
                     if proof() {
                         return;
+                    }
+                    if last_approval_drive.elapsed() >= Duration::from_secs(1)
+                        && instance_status_context(h, name).as_deref() == Some("pty:approval")
+                    {
+                        let (code, stdout, stderr) = h.run(["term", "inject", name, "--enter"]);
+                        assert_eq!(
+                            code, 0,
+                            "{description}: approval confirm failed: stdout={stdout} stderr={stderr}"
+                        );
+                        last_approval_drive = Instant::now();
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -194,6 +207,15 @@ pub fn inject_prompt_until(
         "{description}: injected prompt never produced the expected turn\n{}",
         h.diagnostics()
     );
+}
+
+fn instance_status_context(h: &Hcom, name: &str) -> Option<String> {
+    h.instance_json(name).ok().flatten().and_then(|instance| {
+        instance
+            .get("status_context")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
 }
 
 /// Wait until a tool instance is process-bound; return its canonical name.
@@ -245,8 +267,10 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     let recipient_process_id = format!("hcom-{tool}-recipient-{suffix}");
     let recipient = h.start_with_process_id(&recipient_process_id);
 
-    let file_path = h.workspace.join("lifecycle-file.txt");
-    let shell_path = h.workspace.join("lifecycle-shell.txt");
+    let canonical_workspace =
+        fs::canonicalize(&h.workspace).unwrap_or_else(|_| h.workspace.clone());
+    let file_path = canonical_workspace.join("lifecycle-file.txt");
+    let shell_path = canonical_workspace.join("lifecycle-shell.txt");
     let ids = ScenarioIds {
         initial: format!("HCOM_{}_PHASE1_{suffix}", tool.to_uppercase()),
         inbound: format!("HCOM_{}_INBOUND_{suffix}", tool.to_uppercase()),
@@ -256,6 +280,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         file_path: file_path.to_str().expect("UTF-8 file path").to_string(),
         file_rel: "lifecycle-file.txt".to_string(),
         shell_path: shell_path.to_str().expect("UTF-8 shell path").to_string(),
+        shell_rel: "lifecycle-shell.txt".to_string(),
         send_cmd: String::new(), // filled below
     };
     let ids = ScenarioIds {
@@ -322,6 +347,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         let case = &case;
         let ids = &ids;
         let file_path = file_path.clone();
+        let shell_path = shell_path.clone();
         inject_prompt_until(
             &h,
             &name,
@@ -335,7 +361,10 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
                     .iter()
                     .any(|body| body.contains(&ids.initial) && !case.is_followup_turn(body))
             },
-            || matches!(fs::read_to_string(&file_path), Ok(c) if c.trim() == ids.initial),
+            || {
+                matches!(fs::read_to_string(&file_path), Ok(c) if c.trim() == ids.initial)
+                    && matches!(fs::read_to_string(&shell_path), Ok(c) if c.trim() == ids.initial)
+            },
         );
     }
     assert_eq!(
@@ -345,7 +374,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         ids.initial,
         "file tool must produce the exact token"
     );
-    h.eventually("shell-tool output written", Duration::from_secs(40), || {
+    h.eventually("shell-tool output written", Duration::from_secs(90), || {
         Ok(
             matches!(fs::read_to_string(&shell_path), Ok(c) if c.trim() == ids.initial)
                 .then_some(()),

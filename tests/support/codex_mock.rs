@@ -53,6 +53,11 @@ impl ToolCase for CodexCase {
 
     fn prepare(&self, h: &Hcom, base_url: &str) {
         h.prepare_codex_config(base_url);
+        let (code, stdout, stderr) = h.run(["config", "codex_sandbox_mode", "danger-full-access"]);
+        assert_eq!(
+            code, 0,
+            "set Codex lifecycle sandbox mode failed: stdout={stdout} stderr={stderr}"
+        );
     }
 
     fn launch_args(&self, _h: &Hcom) -> Vec<String> {
@@ -79,7 +84,7 @@ impl ToolCase for CodexCase {
             |call_id: &str| body.contains("function_call_output") && body.contains(call_id);
         let has_custom =
             |call_id: &str| body.contains("custom_tool_call_output") && body.contains(call_id);
-        let write_cmd = format!("echo {} > {}", ids.initial, ids.shell_path);
+        let write_cmd = format!("echo {} > {}", ids.initial, ids.shell_rel);
         let patch = format!(
             "*** Begin Patch\n*** Add File: {}\n+{}\n*** End Patch\n",
             ids.file_rel, ids.initial

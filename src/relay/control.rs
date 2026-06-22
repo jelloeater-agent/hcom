@@ -260,18 +260,46 @@ pub fn send_rpc_request_and_wait_with_db(
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
     ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
-    let request_id = uuid::Uuid::new_v4().to_string();
-    if !send_rpc_control_ephemeral(
-        db,
-        config,
-        action,
-        target_device_short_id,
-        &request_id,
-        params,
-    ) {
-        return Err(format!("failed to send {} request", action));
+
+    let max_attempts = if action == rpc_action::TERM_SCREEN {
+        5
+    } else {
+        1
+    };
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        if !send_rpc_control_ephemeral(
+            db,
+            config,
+            action,
+            target_device_short_id,
+            &request_id,
+            params,
+        ) {
+            if attempt + 1 == max_attempts {
+                return Err(format!("failed to send {} request", action));
+            }
+            continue;
+        }
+
+        match wait_for_rpc_result_with_db(db, &request_id, timeout) {
+            Ok(result) => return Ok(result),
+            Err(e)
+                if action == rpc_action::TERM_SCREEN
+                    && attempt + 1 < max_attempts
+                    && e.starts_with("timed out waiting for rpc_result") =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    wait_for_rpc_result_with_db(db, &request_id, timeout)
+
+    Err(format!("failed to send {} request", action))
 }
 
 pub fn require_successful_rpc_result(response: Value) -> Result<Value, String> {
@@ -1293,6 +1321,7 @@ pub fn handle_control_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
 
     fn test_db() -> HcomDb {
@@ -1388,6 +1417,7 @@ mod tests {
 
     #[test]
     fn test_build_rpc_control_payload_includes_request_id_and_params() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let psk = [0x55u8; 32];
         let config = HcomConfig {
             relay_id: "relay-1".to_string(),

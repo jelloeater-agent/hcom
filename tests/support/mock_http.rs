@@ -176,6 +176,10 @@ fn handle_conn(
     unexpected: Arc<Mutex<Vec<RecordedRequest>>>,
     responder: Arc<dyn Fn(&RecordedRequest) -> Reply + Send + Sync>,
 ) -> std::io::Result<()> {
+    // Accepted streams can inherit nonblocking mode from the listener on some
+    // platforms. The parser below expects ordinary blocking reads with a
+    // timeout, otherwise a partially arrived body may surface as EAGAIN.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);

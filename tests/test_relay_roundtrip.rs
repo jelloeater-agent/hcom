@@ -16,14 +16,14 @@
 //! 9. Cleanup: relay off, daemon stop, remove temp dirs
 //!
 //! Requires:
-//! - hcom installed
+//! - cargo-built hcom test binary
 //! - Network access to public MQTT brokers
-//! - tmux installed
-//! - claude installed and previously launched in /tmp (so the permission
-//!   prompt is already approved — a fresh cwd blocks the TUI from drawing)
+//! - pinned claude installed; model calls are routed to a localhost mock
 //!
 //! Run:
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
+
+mod support;
 
 use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use support::claude_mock::{MODEL, claude_text, claude_tool_use, latest_user_turn};
+use support::mock_http::{MockHttp, RecordedRequest, Reply};
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -101,24 +104,37 @@ impl Drop for TestLog {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+fn hcom_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_hcom"))
+}
+
 fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
-    let mut command = Command::new("hcom");
+    let bin = hcom_bin();
+    let mut command = Command::new(&bin);
     command
         .args(shell_words::split(cmd).unwrap())
         .env("HCOM_DIR", hcom_dir)
         .env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"))
-        // Pin the default terminal to detached tmux. Not every RPC carries
-        // an explicit `terminal` param (resume doesn't, for example), and
-        // without this override the daemon falls back to env-detecting the
-        // outer terminal — which in a typical dev loop (running tests from
-        // kitty) produces a visible "kitty-split" popup. Matches what
-        // test_pty_delivery.rs does for the same reason.
-        .env("HCOM_TERMINAL", "tmux")
-        // Keep claude cheap for the whole test: Haiku, every launch and
-        // every resume. merge_tool_args in launcher.rs picks this up and
-        // folds it into the final claude argv, so the resume path (which
-        // doesn't take `--model` as a trailing arg cleanly) still honors it.
-        .env("HCOM_CLAUDE_ARGS", "--model haiku");
+        // Keep the relay test on the same deterministic localhost Claude mock
+        // path as real_tool_claude.rs. merge_tool_args folds this into launch
+        // and resume. Remote launch uses --headless, so no terminal emulator
+        // (tmux/kitty/etc.) is required in CI.
+        .env(
+            "HCOM_CLAUDE_ARGS",
+            format!("--model {MODEL} --permission-mode bypassPermissions --setting-sources user"),
+        );
+
+    let mut path_entries = Vec::new();
+    if let Some(parent) = bin.parent() {
+        path_entries.push(parent.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries).expect("construct hcom test PATH");
+    command.env("PATH", path);
+
+    apply_env_passthrough(&mut command, hcom_dir);
 
     // Hermetic: strip identity/tag so launched instances keep their base
     // name (e.g. "nano", not "review-d-nano" when the outer agent is tagged
@@ -173,6 +189,27 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
     }
 
     command.output().expect("failed to execute hcom")
+}
+
+fn apply_env_passthrough(command: &mut Command, hcom_dir: &str) {
+    let env_path = Path::new(hcom_dir).join("env");
+    let Ok(content) = fs::read_to_string(env_path) else {
+        return;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || key.starts_with("HCOM_") {
+            continue;
+        }
+        command.env(key, value.trim());
+    }
 }
 
 fn check(label: &str, cmd: &str, hcom_dir: &str) -> String {
@@ -250,8 +287,33 @@ fn parse_names(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn tool_installed(tool: &str) -> bool {
-    Command::new(tool).arg("--version").output().is_ok()
+fn assert_tool_pinned(tool: &str, expected_version: &str, install_hint: &str) {
+    let output = Command::new(tool)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Phase 7 requires {tool} {expected_version}, but `{tool} --version` failed: {e}. Install with: {install_hint}"
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Phase 7 requires {tool} {expected_version}; `{tool} --version` failed\nstdout: {}\nstderr: {}\nInstall with: {install_hint}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let version = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr)
+    } else {
+        String::from_utf8_lossy(&output.stdout)
+    };
+    assert!(
+        version
+            .split_whitespace()
+            .any(|token| token.trim_start_matches('v') == expected_version),
+        "Phase 7 requires {tool} {expected_version}, found `{}`. Install with: {install_hint}",
+        version.trim()
+    );
 }
 
 fn list_instances(hcom_dir: &str) -> Vec<serde_json::Value> {
@@ -426,6 +488,43 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
     )
 }
 
+fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_screen = String::new();
+    while Instant::now() < deadline {
+        let json_out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
+        let screen_out = hcom_with_dir(&format!("term {name}"), hcom_dir);
+        last_screen = String::from_utf8_lossy(&screen_out.stdout).to_string();
+        let low = last_screen.to_lowercase();
+        let bypass_confirm = low.contains("yes, i accept") && low.contains("bypass permissions");
+        let onboarding = bypass_confirm
+            || low.contains("text style")
+            || low.contains("i trust this folder")
+            || low.contains("is this a project")
+            || low.contains("accessing workspace")
+            || low.contains("do you trust")
+            || low.contains("press enter to continue");
+        if screen_out.status.success()
+            && String::from_utf8_lossy(&json_out.stdout).contains("\"prompt_empty\":true")
+            && !onboarding
+        {
+            return;
+        }
+        if bypass_confirm || onboarding {
+            let key = if bypass_confirm { "2 " } else { "" };
+            let inject = hcom_with_dir(&format!("term inject {name} {key}--enter"), hcom_dir);
+            assert!(
+                inject.status.success(),
+                "drive startup inject failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&inject.stdout),
+                String::from_utf8_lossy(&inject.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(800));
+    }
+    panic!("Claude did not reach input prompt within {timeout:?}; last screen:\n{last_screen}");
+}
+
 /// Returns the highest event id currently visible on a device, for use as
 /// `after_id` in `wait_for_ready_event`.
 fn last_event_id(hcom_dir: &str) -> i64 {
@@ -441,16 +540,16 @@ fn last_event_id(hcom_dir: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn try_remote_launch_claude_tmux(
+fn try_remote_launch_claude_headless(
     hcom_dir: &str,
     target_device: &str,
 ) -> Result<(String, String), String> {
     // Model pinning comes via HCOM_CLAUDE_ARGS set in hcom_with_dir.
     // --dir is required for remote launches; use /tmp as cwd — it always
-    // exists on both sides of the local-machine test and claude has already
-    // been trusted there (a never-seen-before cwd triggers a permission
-    // prompt that blocks the TUI from drawing).
-    let cmd = format!("1 claude --device {target_device} --terminal tmux --dir /tmp --go");
+    // exists on both sides of the local-machine test. --headless keeps the
+    // launched Claude on hcom's detached PTY runner, preserving term screen /
+    // inject coverage without requiring tmux or another terminal emulator.
+    let cmd = format!("1 claude --device {target_device} --headless --dir /tmp --go");
     let out = hcom_with_dir(&cmd, hcom_dir);
     if !out.status.success() {
         return Err(format!(
@@ -466,6 +565,95 @@ fn try_remote_launch_claude_tmux(
         .next()
         .ok_or_else(|| format!("Could not parse launched instance name from:\n{stdout}"))?;
     Ok((launched, stdout))
+}
+
+fn remote_term_screen_stdout(hcom_dir: &str, remote_name: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+    while Instant::now() < deadline {
+        ensure_relay_worker(hcom_dir);
+        let out = hcom_with_dir(&format!("term {remote_name}"), hcom_dir);
+        last_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if out.status.success()
+            && !last_stdout.contains("Remote term screen failed")
+            && last_stdout.contains(CLAUDE_PROMPT_MARKER)
+        {
+            return last_stdout;
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    panic!(
+        "remote term_screen did not return prompt marker within 60s\nlast stdout: {last_stdout}\nlast stderr: {last_stderr}"
+    );
+}
+
+fn write_claude_mock_env(hcom_dir: &Path, base_url: &str) {
+    let claude_home = hcom_dir.join("claude-home");
+    fs::create_dir_all(&claude_home).expect("create isolated Claude config dir");
+    let env = [
+        ("ANTHROPIC_BASE_URL", base_url.to_string()),
+        (
+            "ANTHROPIC_AUTH_TOKEN",
+            "hcom-relay-test-dummy-token".to_string(),
+        ),
+        (
+            "CLAUDE_CONFIG_DIR",
+            claude_home.to_string_lossy().to_string(),
+        ),
+        ("DISABLE_LOGIN_COMMAND", "1".to_string()),
+        ("DISABLE_UPDATES", "1".to_string()),
+        ("DISABLE_TELEMETRY", "1".to_string()),
+        ("DISABLE_GROWTHBOOK", "1".to_string()),
+        ("DISABLE_ERROR_REPORTING", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
+        (
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+            "1".to_string(),
+        ),
+        ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_THINKING", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1".to_string()),
+        ("DISABLE_PROMPT_CACHING", "1".to_string()),
+        ("ENABLE_TOOL_SEARCH", "false".to_string()),
+        ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1".to_string()),
+    ];
+    let body = env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect::<String>();
+    fs::write(hcom_dir.join("env"), body).expect("write Claude mock env passthrough");
+}
+
+fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
+    const TOOL_RELAY_PONG: &str = "toolu_relay_pong_send";
+
+    if req.method.eq_ignore_ascii_case("HEAD") {
+        return Reply::Empty(200);
+    }
+    if req.path.contains("count_tokens") {
+        return Reply::Json(serde_json::json!({"input_tokens": 1}).to_string());
+    }
+    if !req.path.contains("/v1/messages") {
+        return Reply::Status(404);
+    }
+    let (tool_result, text) = latest_user_turn(&req.body).unwrap_or_default();
+    if tool_result.as_deref() == Some(TOOL_RELAY_PONG) {
+        return Reply::Sse(claude_text("msg_relay_pong_done", "PONG sent"));
+    }
+    if text.contains("Reply with exactly the single word PONG") {
+        return Reply::Sse(claude_tool_use(
+            "msg_relay_pong_tool",
+            TOOL_RELAY_PONG,
+            "Bash",
+            &serde_json::json!({
+                "command": "hcom send @bigboss --intent inform -- PONG",
+                "description": "send the relay roundtrip PONG response",
+            }),
+        ));
+    }
+    Reply::Sse(claude_text("msg_relay_roundtrip", "OK"))
 }
 
 /// Device A has no *local* instances (the one we launched is on Device B
@@ -583,6 +771,11 @@ fn test_relay_roundtrip() {
     let path_a = dir_a_path.to_string_lossy().to_string();
     let path_b = dir_b_path.to_string_lossy().to_string();
 
+    let claude_mock =
+        MockHttp::start(relay_claude_mock_response).expect("start localhost Claude mock provider");
+    let mock_base_url = format!("http://127.0.0.1:{}", claude_mock.port());
+    write_claude_mock_env(&dir_b_path, &mock_base_url);
+
     let log = TestLog::new();
 
     logln!(log, "{}", "=".repeat(60));
@@ -614,7 +807,7 @@ fn test_relay_roundtrip() {
             None
         },
         "Device A relay connected",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Duration::from_secs(1),
     );
     logln!(log, "  OK: Device A connected to broker");
@@ -679,7 +872,7 @@ fn test_relay_roundtrip() {
             None
         },
         "Device B relay connected",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Duration::from_secs(1),
     );
     logln!(log, "  OK: Device B connected to broker");
@@ -722,7 +915,7 @@ fn test_relay_roundtrip() {
             None
         },
         &format!("Device B sees '{marker}'"),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         Duration::from_secs(2),
     );
     logln!(log, "  OK: Event received: type={}", ev["type"]);
@@ -888,24 +1081,21 @@ fn test_relay_roundtrip() {
     // ── Phase 7: Device A remotely launches on Device B ──────────
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
-    assert!(
-        tool_installed("claude"),
-        "Phase 7 requires claude to be installed"
-    );
-    assert!(
-        tool_installed("tmux"),
-        "Phase 7 requires tmux to be installed"
+    assert_tool_pinned(
+        "claude",
+        "2.1.177",
+        "scripts/install-mock-tools.sh @anthropic-ai/claude-code@2.1.177",
     );
 
     let baseline_event_b = last_event_id(&path_b);
-    let (launched_name, launch_output) = try_remote_launch_claude_tmux(&path_a, &short_b)
+    let (launched_name, launch_output) = try_remote_launch_claude_headless(&path_a, &short_b)
         .unwrap_or_else(|e| {
             panic!("Phase 7: remote launch failed: {e}");
         });
     logln!(log, "{}", launch_output.trim_end());
     logln!(
         log,
-        "  OK: Remote launch succeeded with claude/tmux: {launched_name}"
+        "  OK: Remote launch succeeded with claude/headless: {launched_name}"
     );
     guard.register_local_b(launched_name.clone());
     let launched_tool = "claude".to_string();
@@ -943,6 +1133,7 @@ fn test_relay_roundtrip() {
         log,
         "  Waiting for claude lifecycle ready event on Device B..."
     );
+    drive_claude_startup(&path_b, &launched_name, Duration::from_secs(90));
     let _ready_event_id = wait_for_ready_event(
         &path_b,
         &launched_name,
@@ -967,22 +1158,9 @@ fn test_relay_roundtrip() {
     );
 
     // Plain-text remote call: should print the formatted screen (containing
-    // the claude ready banner). Fails closed if the RPC errored.
-    let term_screen_out = hcom_with_dir(&format!("term {remote_name}"), &path_a);
-    let term_screen_stdout = String::from_utf8_lossy(&term_screen_out.stdout).to_string();
-    assert!(
-        term_screen_out.status.success(),
-        "remote term_screen CLI exited non-zero\nstdout: {term_screen_stdout}\nstderr: {}",
-        String::from_utf8_lossy(&term_screen_out.stderr)
-    );
-    assert!(
-        !term_screen_stdout.contains("Remote term screen failed"),
-        "remote term_screen reported failure:\n{term_screen_stdout}"
-    );
-    assert!(
-        term_screen_stdout.contains(CLAUDE_PROMPT_MARKER),
-        "remote term_screen stdout missing claude prompt marker '{CLAUDE_PROMPT_MARKER}':\n{term_screen_stdout}"
-    );
+    // the Claude ready banner). It is read-only over a public broker, so retry
+    // transient publish/response misses instead of making the whole test flaky.
+    remote_term_screen_stdout(&path_a, &remote_name);
     logln!(
         log,
         "  OK: remote term_screen stdout contains claude prompt marker"
@@ -1419,8 +1597,8 @@ fn test_relay_roundtrip() {
 
     // Register any spawned instances for cleanup BEFORE the poll/assertions,
     // using whatever names the CLI already printed. Resume can spawn a real
-    // Claude agent in a detached tmux session — if a later poll or assertion
-    // panics, the guard's Drop still needs to close those panes.
+    // Claude agent in a detached headless PTY — if a later poll or assertion
+    // panics, the guard's Drop still needs to kill that process group.
     for n in parse_names(&resume_stdout) {
         guard.register_local_b(n);
     }
@@ -1488,6 +1666,7 @@ fn test_relay_roundtrip() {
     );
     guard.register_local_b(resumed_full_name.clone());
 
+    drive_claude_startup(&path_b, &resumed_full_name, Duration::from_secs(90));
     let _resume_ready_id = wait_for_ready_event_any(
         &path_b,
         &[&resumed_full_name, &resumed_name],
@@ -1551,6 +1730,24 @@ fn test_relay_roundtrip() {
     logln!(
         log,
         "  OK: resumed instance is rebound to hcom (screen={screen_has_marker}, events={events_have_bootstrap}, transcript={transcript_has_marker}, hooks_bound={hooks_bound})"
+    );
+
+    let unexpected = claude_mock.unexpected();
+    assert!(
+        unexpected.is_empty(),
+        "Claude mock received {} unexpected request(s):\n{}",
+        unexpected.len(),
+        unexpected
+            .iter()
+            .map(|req| format!("{} {}\n{}", req.method, req.path, req.body))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let transport_errors = claude_mock.transport_errors();
+    assert!(
+        transport_errors.is_empty(),
+        "Claude mock hit transport errors:\n{}",
+        transport_errors.join("\n")
     );
 
     // Cleanup handled by guard Drop

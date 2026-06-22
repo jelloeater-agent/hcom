@@ -18,7 +18,7 @@ jobs:
   real-tool-tests:
     name: Real tool (${{ matrix.tool }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
     strategy:
@@ -27,10 +27,16 @@ jobs:
         include:
           - tool: codex
             package: "@openai/codex@0.139.0"
+            cache: codex-0.139.0
             test: real_tool_codex
           - tool: claude
             package: "@anthropic-ai/claude-code@2.1.177"
+            cache: claude-2.1.177
             test: real_tool_claude
+          - tool: relay
+            package: "@anthropic-ai/claude-code@2.1.177"
+            cache: relay-claude-2.1.177
+            test: test_relay_roundtrip
     steps:
       - uses: actions/checkout@v6
         with:
@@ -40,5 +46,12 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: npm install --global '${{ matrix.package }}'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/mock-tools
+            target/npm-cache
+          key: ${{ runner.os }}-mock-tools-${{ matrix.cache }}
+      - run: ./scripts/install-mock-tools.sh '${{ matrix.package }}'
+      - run: echo "$PWD/target/mock-tools/bin" >> "$GITHUB_PATH"
       - run: cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1

@@ -306,7 +306,7 @@ impl ToolCase for ClaudeCase {
                     TOOL_SHELL,
                     "Bash",
                     &json!({
-                        "command": format!("echo {} > {}", ids.initial, ids.shell_path),
+                        "command": format!("echo {} > {}", ids.initial, ids.shell_rel),
                         "description": "write the lifecycle shell marker",
                     }),
                 )),
