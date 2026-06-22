@@ -165,12 +165,25 @@ pub fn inject_prompt_until(
     mut accepted: impl FnMut() -> bool,
     mut proof: impl FnMut() -> bool,
 ) {
-    for _attempt in 0..5 {
+    let inject_deadline = Instant::now() + Duration::from_secs(40);
+    let mut prompt_attempts = 0;
+    while prompt_attempts < 5 && Instant::now() < inject_deadline {
         let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter"]);
-        assert_eq!(
-            code, 0,
-            "{description}: inject failed: stdout={stdout} stderr={stderr}"
-        );
+        if code != 0 {
+            let retryable = stdout.contains("No inject port")
+                || stdout.contains("No response from")
+                || stderr.contains("No inject port")
+                || stderr.contains("No response from");
+            if retryable {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            assert_eq!(
+                code, 0,
+                "{description}: inject failed: stdout={stdout} stderr={stderr}"
+            );
+        }
+        prompt_attempts += 1;
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if proof() {
@@ -912,7 +925,9 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
     );
 
     // --- Phase 8: resume parent under the same identity -----------------------
-    let (resume_code, resume_stdout, resume_stderr) = h.run(["r", &name]);
+    let resume_prompt = format!("Confirm the resumed session {}", ids.resume);
+    let (resume_code, resume_stdout, resume_stderr) =
+        h.run(["r", &name, "--hcom-prompt", &resume_prompt]);
     assert_eq!(
         resume_code,
         0,
@@ -932,27 +947,21 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
             .map(|pid| pid.filter(|pid| *pid > 1 && *pid != initial_pid))
     });
     wait_pty_ready(&h, &name, "resumed PTY inject endpoint");
-    {
+    let resumed_transcript = {
         let mock = &mock;
         let ids = &ids;
-        inject_prompt_until(
-            &h,
-            &name,
-            &format!("Confirm the resumed session {}", ids.resume),
-            "resumed lifecycle prompt",
-            || {
-                mock.request_bodies()
-                    .iter()
-                    .any(|body| body.contains(&ids.resume))
-            },
-            || {
-                let (code, stdout, _stderr) = h.run(["transcript", &name, "--full"]);
-                code == 0 && stdout.contains(RESUME_PROOF)
-            },
-        );
-    }
-    let (_, resumed_transcript, resumed_transcript_stderr) = h.run(["transcript", &name, "--full"]);
-    assert!(resumed_transcript_stderr.is_empty() || !resumed_transcript.is_empty());
+        h.eventually("resumed lifecycle prompt", Duration::from_secs(60), || {
+            let resume_reached_model = mock
+                .request_bodies()
+                .iter()
+                .any(|body| body.contains(&ids.resume));
+            let (code, stdout, stderr) = h.run(["transcript", &name, "--full"]);
+            if code != 0 {
+                return Err(format!("resumed transcript failed: {stderr}"));
+            }
+            Ok((resume_reached_model && stdout.contains(RESUME_PROOF)).then_some(stdout))
+        })
+    };
     assert!(
         resumed_transcript.contains(INITIAL_PROOF)
             && resumed_transcript.contains(RESUME_PROOF)
