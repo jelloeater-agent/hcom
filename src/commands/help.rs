@@ -927,12 +927,16 @@ Commands:\n\
 
 /// Flags accepted by both `hcom <tool>` (fresh launch) and `hcom r` / `hcom f`
 /// (resume/fork). Indented to 4 spaces for tool help, re-indented for resume.
+///
+/// NOTE: `--run-here` / `--no-run-here` are intentionally omitted from help.
+/// They still work — they're parsed in launch.rs and resume.rs — but they're
+/// an internal detail (TUI injects `--no-run-here`) and a power-user escape
+/// hatch (unsupported terminal emulators), not something to advertise.
 const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background"),
-    ("--run-here", "Run in current terminal"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
 ];

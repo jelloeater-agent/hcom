@@ -496,7 +496,6 @@ fn proot_termux_launch_error() -> &'static str {
      in host Termux.\n\n\
      Use one of:\n\
        hcom <tool> --headless\n\
-       hcom <tool> --run-here\n\
        hcom <tool> --terminal tmux"
 }
 
@@ -2012,7 +2011,6 @@ mod tests {
     fn test_proot_termux_launch_error_is_actionable() {
         let message = proot_termux_launch_error();
         assert!(message.contains("--headless"));
-        assert!(message.contains("--run-here"));
         assert!(message.contains("--terminal tmux"));
     }
 
