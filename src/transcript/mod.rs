@@ -734,6 +734,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_include_pi_coding_agent_dir_sessions() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe {
@@ -752,6 +753,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_use_xdg_data_home_only_on_supported_platforms() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let xdg = tempfile::tempdir().unwrap();
@@ -785,6 +787,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_ignore_uninitialized_xdg_root() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let xdg = tempfile::tempdir().unwrap();
@@ -803,6 +806,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_honor_pi_config_dir_and_default_profile_sentinels() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         unsafe {
@@ -824,6 +828,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_agent_override_disables_xdg_and_is_ignored_by_named_profiles() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let xdg = tempfile::tempdir().unwrap();
@@ -856,6 +861,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_never_include_pi_session_dir_override() {
         // PI_CODING_AGENT_SESSION_DIR is Pi-exclusive: OMP never reads it, so it
         // must not appear as an OMP search root (else OMP claims Pi sessions).
@@ -882,6 +888,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn omp_disk_roots_use_named_profile_subtree() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe {

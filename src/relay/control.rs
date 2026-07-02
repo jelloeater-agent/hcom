@@ -1416,6 +1416,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_rpc_control_payload_includes_request_id_and_params() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let psk = [0x55u8; 32];
@@ -1640,6 +1641,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_handle_control_events_relay_off_disables_local_relay() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let config = HcomConfig {

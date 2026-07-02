@@ -2438,6 +2438,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_derive_omp_transcript_path_checks_xdg_data_home() {
         if !cfg!(any(
             target_os = "linux",
@@ -2467,6 +2468,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_find_session_on_disk_prefers_omp_for_omp_paths() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         unsafe {
@@ -2489,6 +2491,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_find_session_on_disk_attributes_pi_session_dir_to_pi() {
         // Regression guard for the shared-root bug: a Pi session reached via the
         // Pi-exclusive PI_CODING_AGENT_SESSION_DIR override must be attributed to
@@ -2512,6 +2515,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_find_session_on_disk_attributes_shared_agent_dir_by_path_marker() {
         // The genuinely-shared PI_CODING_AGENT_DIR: attribution must key on the
         // path's product marker (.pi vs .omp), not on which tool's root list or
@@ -2545,6 +2549,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_markerless_shared_agent_dir_is_ambiguous_not_guessed() {
         // Arbitrary shared PI_CODING_AGENT_DIR with no .pi/.omp marker must be
         // reported ambiguous, never silently attributed — even when the caller
@@ -2579,6 +2584,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_derive_omp_transcript_path_checks_named_profile() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         unsafe {

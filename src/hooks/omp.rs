@@ -905,6 +905,7 @@ mod tests {
         f(&home);
     }
     #[test]
+    #[serial_test::serial]
     fn plugin_dir_respects_pi_coding_agent_dir() {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let custom = home.join("custom-omp");
