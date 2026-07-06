@@ -56,11 +56,11 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "plain text"
+- Message: send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- 'plain text'
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
-  Example: send @luna @nova --intent ack --reply-to 82 --name {instance_name} -- "ok"
+  Example: send {target_luna} {target_nova} --intent ack --reply-to 82 --name {instance_name} -- 'ok'
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
-- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
+- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
@@ -81,7 +81,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 1. Task via hcom → ack immediately, do work, report via hcom
 2. No filler messages (greetings, thanks, congratulations).
 3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-4. User says "the gemini/claude/codex agent" or unclear → run `hcom list` to resolve name
+4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 {active_instances}
@@ -89,7 +89,7 @@ Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 This is session context, not a task for immediate action."#;
 
 const TAG_NOTICE: &str = r#"
-You are tagged "{tag}". Message your group: send @{tag}- -- msg"#;
+You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
 
 const RELAY_NOTICE: &str = r#"
 Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in. Remote hcom events needs --remote-fetch --device BOXE. Remote events sub needs --device BOXE."#;
@@ -161,7 +161,7 @@ Messages do NOT arrive automatically.
 LISTENING REQUIREMENT:
 - After sending hcom message expecting reply → `hcom listen --timeout 60 --name {instance_name}`
 - After receiving a task via hcom → do the work, report, then enter CONNECTED MODE
-- User says "stay connected" → enter CONNECTED MODE
+- User says 'stay connected' → enter CONNECTED MODE
 
 CONNECTED MODE:
 1. Run exactly one foreground blocking command:
@@ -192,7 +192,7 @@ You're participating in the hcom multi-agent network.
 - Your name: {subagent_name}
 - Your parent: {parent_name}
 - Use "--name {subagent_name}" for all hcom commands
-- Announce to parent once: send @{parent_name} --intent inform -- "Connected as {subagent_name}"
+- Announce to parent once: send {target_parent} --intent inform -- "Connected as {subagent_name}"
 
 Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
@@ -207,8 +207,8 @@ Response rules:
 hcom message → respond via hcom send
 
 Commands:
-  {hcom_cmd} send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
-  Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 --name {subagent_name} -- "ok"  |  Code/markdown: replace "ok" with --file <path>
+  {hcom_cmd} send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  Example: {hcom_cmd} send {target_luna} {target_nova} --intent ack --reply-to 82 --name {subagent_name} -- "ok"  |  Code/markdown: replace "ok" with --file <path>
   {hcom_cmd} list --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
@@ -277,6 +277,19 @@ fn launch_tool_names() -> String {
         .map(|spec| spec.name)
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// Render an hcom recipient token safely for the current platform's shell.
+///
+/// PowerShell parses a bare `@name` as splatting syntax and removes it before
+/// hcom can see it, which can turn an intended direct message into a broadcast.
+fn recipient_token(name: &str) -> String {
+    let token = format!("@{name}");
+    if cfg!(windows) {
+        format!("'{token}'")
+    } else {
+        token
+    }
 }
 
 /// Get combined list of bundled + user scripts.
@@ -392,6 +405,10 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{active_instances}", &ctx.active_instances)
         .replace("{scripts}", &ctx.scripts)
         .replace("{launch_tools}", &ctx.launch_tools)
+        .replace("{target_name_s}", &recipient_token("name(s)"))
+        .replace("{target_luna}", &recipient_token("luna"))
+        .replace("{target_nova}", &recipient_token("nova"))
+        .replace("{target_tag}", &recipient_token(&format!("{}-", ctx.tag)))
         .replace("{{", "{")
         .replace("}}", "}")
 }
@@ -499,13 +516,24 @@ pub fn get_bootstrap(
 
     // Rewrite hcom references if using alternate command
     if ctx.hcom_cmd != "hcom" {
-        let sentinel = "__HCOM_CMD__";
-        result = result.replace(&ctx.hcom_cmd, sentinel);
+        let command_sentinel = "__HCOM_CMD__";
+        let marker_sentinel = "__HCOM_IDENTITY_MARKER__";
+        let open_tag_sentinel = "__HCOM_OPEN_TAG__";
+        let close_tag_sentinel = "__HCOM_CLOSE_TAG__";
+        result = result
+            .replace(&ctx.hcom_cmd, command_sentinel)
+            .replace("[hcom:", marker_sentinel)
+            .replace("<hcom>", open_tag_sentinel)
+            .replace("</hcom>", close_tag_sentinel);
         result = regex::Regex::new(r"\bhcom\b")
             .unwrap()
             .replace_all(&result, &ctx.hcom_cmd)
             .to_string();
-        result = result.replace(sentinel, &ctx.hcom_cmd);
+        result = result
+            .replace(command_sentinel, &ctx.hcom_cmd)
+            .replace(marker_sentinel, "[hcom:")
+            .replace(open_tag_sentinel, "<hcom>")
+            .replace(close_tag_sentinel, "</hcom>");
     }
 
     format!(
@@ -521,6 +549,10 @@ pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String 
     let result = SUBAGENT_BOOTSTRAP
         .replace("{subagent_name}", subagent_name)
         .replace("{parent_name}", parent_name)
+        .replace("{target_parent}", &recipient_token(parent_name))
+        .replace("{target_name_s}", &recipient_token("name(s)"))
+        .replace("{target_luna}", &recipient_token("luna"))
+        .replace("{target_nova}", &recipient_token("nova"))
         .replace("{hcom_cmd}", &hcom_cmd)
         .replace("{SENDER}", SENDER);
 
@@ -717,8 +749,12 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("tagged \"p0c\""));
-        assert!(result.contains("send @p0c-"));
+        assert!(result.contains("tagged 'p0c'"));
+        if cfg!(windows) {
+            assert!(result.contains("send '@p0c-'"));
+        } else {
+            assert!(result.contains("send @p0c-"));
+        }
     }
 
     #[test]
@@ -792,6 +828,40 @@ mod tests {
         assert!(result.contains("--name luna_reviewer_1"));
         assert!(result.contains(SENDER));
         assert!(result.contains("</hcom>"));
+        if cfg!(windows) {
+            assert!(result.contains("send '@luna' --intent inform"));
+            assert!(result.contains("send '@name(s)'"));
+        } else {
+            assert!(result.contains("send @luna --intent inform"));
+            assert!(result.contains("send @name(s)"));
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_quotes_send_recipients_on_windows() {
+        let (tmp, db) = setup_test_db();
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            "claude",
+            false,
+            true,
+            "",
+            "team",
+            false,
+            None,
+        );
+
+        if cfg!(windows) {
+            assert!(result.contains("send '@name(s)'"));
+            assert!(result.contains("send '@luna' '@nova'"));
+            assert!(result.contains("send '@team-' -- msg"));
+        } else {
+            assert!(result.contains("send @name(s)"));
+            assert!(result.contains("send @luna @nova"));
+            assert!(result.contains("send @team- -- msg"));
+        }
     }
 
     #[test]
@@ -1027,7 +1097,7 @@ mod tests {
             None,
         );
 
-        assert!(result.contains("tagged \"team-a\""));
+        assert!(result.contains("tagged 'team-a'"));
         assert!(!result.contains("team-b"));
     }
 

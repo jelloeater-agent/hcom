@@ -15,6 +15,12 @@ use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
+/// Whether the wrapped child exited because hcom killed it (vs. closed on its
+/// own). Set by the PTY proxy (Unix) and read here during delivery cleanup to
+/// choose the exit status context. Lives here rather than in `pty` so the
+/// delivery loop compiles on platforms without the PTY wrapper.
+pub static EXIT_WAS_KILLED: AtomicBool = AtomicBool::new(false);
+
 /// Safely truncate a string to at most `max_chars` characters.
 /// Unlike byte slicing `&s[..n]`, this won't panic on multi-byte UTF-8.
 pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -159,6 +165,7 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
 /// whose chrome doesn't render OSC titles. Currently only herdr; add a
 /// `Backend` variant and a `resolve` arm to support another.
 mod host_label {
+    #[cfg(unix)]
     use std::time::Duration;
 
     use crate::db::HcomDb;
@@ -167,6 +174,7 @@ mod host_label {
 
     /// Long enough to absorb a slow herdr server tick, short enough that a
     /// dead socket doesn't visibly stall the delivery loop.
+    #[cfg(unix)]
     const SOCKET_TIMEOUT: Duration = Duration::from_millis(200);
 
     /// Per-loop state: which backend (if any) we resolved at startup, and the
@@ -785,6 +793,13 @@ fn launch_ready_observed(
     let screen = state.screen.read().unwrap();
     if config.block_on_approval && screen.approval {
         return false;
+    }
+    // Copilot's SessionStart hook binds the real CLI session after startup and
+    // only after the initial prompt has completed. That binding is authoritative
+    // readiness evidence even when newer Copilot versions omit or redraw the
+    // historical "/ commands" footer before the screen scraper observes it.
+    if config.tool == "copilot" && db.has_session(name) {
+        return true;
     }
     if config.launch_ready_on_plugin_bind {
         // Authoritative readiness for plugin-driven tools (OMP): the extension's
@@ -2007,7 +2022,7 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         }
     };
 
-    let was_killed = crate::pty::EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {
@@ -2433,6 +2448,29 @@ mod tests {
         // The extension bind is the authoritative signal.
         db.upsert_notify_endpoint("vupo", "plugin", 4002).unwrap();
         assert!(launch_ready_observed(&db, "vupo", &config, &state));
+    }
+
+    #[test]
+    fn copilot_session_binding_satisfies_launch_readiness() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, created_at)
+                 VALUES ('mira', 'copilot', 'copilot-session-1', 0)",
+                [],
+            )
+            .unwrap();
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+
+        assert!(launch_ready_observed(
+            &db,
+            "mira",
+            &ToolConfig::for_tool(crate::tool::Tool::Copilot),
+            &state
+        ));
     }
 
     #[test]

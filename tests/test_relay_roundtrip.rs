@@ -22,6 +22,9 @@
 //!
 //! Run:
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
+//!
+//! The harness uses platform-specific daemon cleanup where needed, but the
+//! relay contract itself runs unchanged on Unix and Windows.
 
 mod support;
 
@@ -29,7 +32,7 @@ use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -106,6 +109,17 @@ impl Drop for TestLog {
 
 fn hcom_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hcom"))
+}
+
+/// The hcom test binary as a Git-Bash-safe, forward-slash, single-quoted
+/// path, for embedding in a Bash tool command string. Claude's Bash tool runs
+/// under Git Bash on Windows, whose PATH does not reliably carry this test
+/// binary's directory through relay-worker → ConPTY-child → Bash-tool
+/// process inheritance — reference the exact binary rather than relying on
+/// bare `hcom` resolving via PATH. Mirrors `support::Hcom::bash_hcom_command`.
+fn bash_hcom_command() -> String {
+    let path = hcom_bin().to_string_lossy().replace('\\', "/");
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
@@ -188,7 +202,62 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         command.env_remove(var);
     }
 
-    command.output().expect("failed to execute hcom")
+    run_command_with_timeout(command, cmd, Duration::from_secs(90))
+}
+
+/// Capture through files rather than `Command::output()` pipes. On Windows a
+/// detached relay worker can inherit the parent's anonymous pipe handles even
+/// though its own stdio is null, preventing `output()` from ever observing EOF
+/// after the short-lived CLI parent exits.
+fn run_command_with_timeout(mut command: Command, label: &str, timeout: Duration) -> Output {
+    let stdout_file = tempfile::tempfile().expect("create hcom stdout capture");
+    let stderr_file = tempfile::tempfile().expect("create hcom stderr capture");
+    command
+        .stdout(Stdio::from(
+            stdout_file.try_clone().expect("clone stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr_file.try_clone().expect("clone stderr capture"),
+        ));
+
+    let mut child = command.spawn().expect("failed to execute hcom");
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = read_capture(&stdout_file);
+                let stderr = read_capture(&stderr_file);
+                panic!(
+                    "hcom command timed out after {timeout:?}: {label}\n\
+                     -- stdout --\n{}\n-- stderr --\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => panic!("failed waiting for hcom command `{label}`: {error}"),
+        }
+    };
+
+    Output {
+        status,
+        stdout: read_capture(&stdout_file),
+        stderr: read_capture(&stderr_file),
+    }
+}
+
+fn read_capture(file: &std::fs::File) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file.try_clone().expect("clone command capture for reading");
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind command capture");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read command capture");
+    bytes
 }
 
 fn apply_env_passthrough(command: &mut Command, hcom_dir: &str) {
@@ -287,8 +356,43 @@ fn parse_names(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Build a command for `tool` resolved against the real process `PATH`,
+/// following npm's Windows `.cmd`/`.bat` shims that `CreateProcess` cannot
+/// execute directly (mirrors `support::Hcom::external_cmd`, which resolves
+/// against an isolated PATH instead of the real environment).
+fn external_tool_command(tool: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let resolved = std::env::split_paths(&path_var)
+            .flat_map(|dir| {
+                [".COM", ".EXE", ".BAT", ".CMD", ""]
+                    .map(move |ext| dir.join(format!("{tool}{ext}")))
+            })
+            .find(|candidate| candidate.is_file());
+        match resolved {
+            Some(path)
+                if matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                ) =>
+            {
+                let mut command = Command::new("cmd.exe");
+                command.args(["/d", "/c"]).arg(path);
+                command
+            }
+            Some(path) => Command::new(path),
+            None => Command::new(tool),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(tool)
+    }
+}
+
 fn assert_tool_pinned(tool: &str, expected_version: &str, install_hint: &str) {
-    let output = Command::new(tool)
+    let output = external_tool_command(tool)
         .arg("--version")
         .output()
         .unwrap_or_else(|e| {
@@ -369,10 +473,51 @@ fn poll_rpc_result_on_device(hcom_dir: &str, action: &str) -> serde_json::Value 
     )
 }
 
-/// Claude's input prompt marker — present whenever the TUI is rendered,
-/// independent of the dontAsk / accept-edits mode that hides the
-/// "? for shortcuts" status bar.
-const CLAUDE_PROMPT_MARKER: &str = "❯";
+/// True if `text` has Claude's input prompt marker at the start of a rendered
+/// screen line, present whenever the TUI is rendered, independent of the
+/// dontAsk / accept-edits mode that hides the "? for shortcuts" status bar.
+/// `--permission-mode bypassPermissions` (used by this test) renders a plain
+/// `>` instead of the styled `❯`. Requiring the marker to lead the line (not
+/// just appear anywhere) keeps this from matching an unrelated `>` in tips,
+/// diffs, or other screen content.
+fn screen_has_claude_prompt(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = strip_term_line_number_prefix(line).trim_start();
+        trimmed.starts_with('❯') || trimmed.starts_with('>')
+    })
+}
+
+/// Strip `hcom term`'s "  <N>: " row-index prefix (see `src/commands/term.rs`
+/// `format!("  {i:3}: {text}")`), if present, so line-start checks work on
+/// both `--json` line arrays (no prefix) and the default rendered output
+/// (prefixed).
+fn strip_term_line_number_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits_end > 0 && trimmed[digits_end..].starts_with(": ") {
+        &trimmed[digits_end + 2..]
+    } else {
+        line
+    }
+}
+
+#[test]
+fn screen_has_claude_prompt_matches_styled_and_ascii_markers() {
+    assert!(screen_has_claude_prompt("❯ \n──────"));
+    assert!(screen_has_claude_prompt("> \n──────"));
+    assert!(screen_has_claude_prompt("  15: > \n  16: ──────"));
+}
+
+#[test]
+fn screen_has_claude_prompt_ignores_unrelated_greater_than() {
+    // A `>` appearing mid-line (a tip, a diff, redirected output) is not the
+    // input prompt and must not produce a false positive.
+    assert!(!screen_has_claude_prompt("Tip: pipe output > file.txt"));
+    assert!(!screen_has_claude_prompt("  12: some text > more text"));
+    assert!(!screen_has_claude_prompt("no prompt here at all"));
+}
 
 fn get_screen_local_json(hcom_dir: &str, name: &str) -> Option<serde_json::Value> {
     let out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
@@ -474,7 +619,7 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
     poll_until(
         || {
             let s = get_screen_local_json(hcom_dir, name)?;
-            let has_prompt = screen_lines_joined(&s).contains(CLAUDE_PROMPT_MARKER);
+            let has_prompt = screen_has_claude_prompt(&screen_lines_joined(&s));
             let prompt_empty = s["prompt_empty"].as_bool() == Some(true);
             if has_prompt && prompt_empty {
                 Some(s)
@@ -545,11 +690,15 @@ fn try_remote_launch_claude_headless(
     target_device: &str,
 ) -> Result<(String, String), String> {
     // Model pinning comes via HCOM_CLAUDE_ARGS set in hcom_with_dir.
-    // --dir is required for remote launches; use /tmp as cwd — it always
-    // exists on both sides of the local-machine test. --headless keeps the
+    // --dir is required for remote launches; use the platform temp directory,
+    // which exists on both sides of this local-machine test. --headless keeps the
     // launched Claude on hcom's detached PTY runner, preserving term screen /
     // inject coverage without requiring tmux or another terminal emulator.
-    let cmd = format!("1 claude --device {target_device} --headless --dir /tmp --go");
+    let launch_dir = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+    let cmd = format!(
+        "1 claude --device {target_device} --headless --dir {} --go",
+        shell_words::quote(&launch_dir)
+    );
     let out = hcom_with_dir(&cmd, hcom_dir);
     if !out.status.success() {
         return Err(format!(
@@ -578,7 +727,7 @@ fn remote_term_screen_stdout(hcom_dir: &str, remote_name: &str) -> String {
         last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
         if out.status.success()
             && !last_stdout.contains("Remote term screen failed")
-            && last_stdout.contains(CLAUDE_PROMPT_MARKER)
+            && screen_has_claude_prompt(&last_stdout)
         {
             return last_stdout;
         }
@@ -648,7 +797,7 @@ fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
             TOOL_RELAY_PONG,
             "Bash",
             &serde_json::json!({
-                "command": "hcom send @bigboss --intent inform -- PONG",
+                "command": format!("{} send @bigboss --intent inform -- PONG", bash_hcom_command()),
                 "description": "send the relay roundtrip PONG response",
             }),
         ));
@@ -656,12 +805,11 @@ fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
     Reply::Sse(claude_text("msg_relay_roundtrip", "OK"))
 }
 
-/// Device A has no *local* instances (the one we launched is on Device B
-/// and appears as an origin_device_id-tagged mirror row). The relay
-/// worker's auto-exit watchdog checks every 30s and shuts the worker down
-/// after 2 consecutive empty checks — so Device A's worker dies ~60s
-/// after Phase 7, right before we need it for the long Phase 10 / 14
-/// polling. Re-arm it before each long-running RPC on Device A.
+/// `hcom relay on` is idempotent — a no-op if the worker is already running.
+/// The worker's auto-exit watchdog only fires when relay is *not* enabled in
+/// config (see `auto_exit_watchdog` in src/relay/worker.rs); both test
+/// devices enable relay in Phases 1/3, so this call is cheap insurance
+/// before an RPC rather than a fix for a known auto-exit race.
 fn ensure_relay_worker(hcom_dir: &str) {
     let out = hcom_with_dir("relay on", hcom_dir);
     if !out.status.success() {
@@ -673,10 +821,48 @@ fn ensure_relay_worker(hcom_dir: &str) {
     thread::sleep(Duration::from_millis(500));
 }
 
+/// Diagnostic snapshot for a Phase 10 timeout (either step): both devices'
+/// relay status, Device B's live screen and recent events, and the last few
+/// requests the Claude mock actually received. A bare "timed out" panic gives
+/// no way to tell a relay-delivery problem from a stuck turn from a Bash tool
+/// call failing outright — this makes a CI failure here diagnosable without
+/// another round-trip.
+fn phase10_diagnostics(
+    path_a: &str,
+    path_b: &str,
+    launched_name: &str,
+    claude_mock: &MockHttp,
+) -> String {
+    let device_b_screen = get_screen_local_json(path_b, launched_name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<no screen>".to_string());
+    let device_b_events = hcom_with_dir("events --last 20", path_b);
+    let relay_status_a = hcom_with_dir("relay status", path_a);
+    let relay_status_b = hcom_with_dir("relay status", path_b);
+    let recent_mock_requests: String = claude_mock
+        .requests()
+        .iter()
+        .rev()
+        .take(3)
+        .map(|r| format!("  {} {}\n  body: {}\n", r.method, r.path, r.body))
+        .collect();
+    format!(
+        "Device A relay status:\n{}\n\
+         Device B relay status:\n{}\n\
+         Device B screen: {device_b_screen}\n\
+         Device B recent events:\n{}\n\
+         Last mock requests (newest first):\n{recent_mock_requests}",
+        String::from_utf8_lossy(&relay_status_a.stdout),
+        String::from_utf8_lossy(&relay_status_b.stdout),
+        String::from_utf8_lossy(&device_b_events.stdout),
+    )
+}
+
 /// Kill orphan debug relay-worker processes from previous failed test runs.
 /// Without this, a stale daemon can hold MQTT connections and interfere with
 /// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
 /// PIDs once the old temp dir is deleted).
+#[cfg(unix)]
 fn kill_orphan_debug_daemons() {
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", "target/debug/hcom relay-worker"])
@@ -694,25 +880,19 @@ fn kill_orphan_debug_daemons() {
     }
 }
 
+#[cfg(windows)]
+fn kill_orphan_debug_daemons() {
+    // Windows has no built-in command-line process matcher equivalent to
+    // pgrep. Each run uses unique HCOM_DIRs and its PID-file-owned daemons are
+    // still cleaned by RelayGuard below.
+}
+
 fn kill_daemon(hcom_dir: &str) {
     let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
     if let Ok(content) = fs::read_to_string(&pid_path)
-        && let Ok(pid) = content.trim().parse::<i32>()
+        && let Ok(pid) = content.trim().parse::<i64>()
     {
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        // Wait up to 3s
-        for _ in 0..30 {
-            thread::sleep(Duration::from_millis(100));
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return;
-            }
-        }
-        // Still alive — SIGKILL
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        support::terminate_process_group(pid);
     }
 }
 
@@ -1081,10 +1261,12 @@ fn test_relay_roundtrip() {
     // ── Phase 7: Device A remotely launches on Device B ──────────
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
+    let claude_version =
+        std::env::var("HCOM_TEST_CLAUDE_VERSION").unwrap_or_else(|_| "2.1.185".to_string());
     assert_tool_pinned(
         "claude",
-        "2.1.185",
-        "scripts/install-mock-tools.sh @anthropic-ai/claude-code@2.1.185",
+        &claude_version,
+        &format!("scripts/install-mock-tools.sh @anthropic-ai/claude-code@{claude_version}"),
     );
 
     let baseline_event_b = last_event_id(&path_b);
@@ -1148,7 +1330,7 @@ fn test_relay_roundtrip() {
     assert_eq!(initial_screen["prompt_empty"].as_bool(), Some(true));
     logln!(
         log,
-        "  OK: claude TUI drawn (prompt marker '{CLAUDE_PROMPT_MARKER}' present, prompt empty)"
+        "  OK: claude TUI drawn (prompt marker present, prompt empty)"
     );
 
     // ── Phase 8: term_screen on live instance ─────────────────────
@@ -1179,7 +1361,7 @@ fn test_relay_roundtrip() {
     );
     let rpc_content = rpc_screen["result"]["content"].as_str().unwrap_or("");
     assert!(
-        rpc_content.contains(CLAUDE_PROMPT_MARKER),
+        screen_has_claude_prompt(rpc_content),
         "term_screen rpc_result.content missing claude prompt marker: {rpc_content}"
     );
     logln!(
@@ -1280,9 +1462,23 @@ fn test_relay_roundtrip() {
         Duration::from_secs(15),
         Duration::from_millis(500),
     );
+    // Clearing the input line only proves that Claude accepted the submitted
+    // marker. ConPTY can report that frame before the turn finishes, while
+    // delivery is still gated. Wait for the stable idle prompt before sending
+    // the Phase 10 message.
+    wait_for_screen_drawn(&path_b, &launched_name, Duration::from_secs(60));
+    poll_until(
+        || {
+            let instance = find_instance_by_base(&path_b, &launched_name)?;
+            (instance["status"].as_str() == Some("listening")).then_some(())
+        },
+        "Claude returned to listening after marker turn",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
     logln!(
         log,
-        "  OK: marker consumed from input after enter; both inject RPCs ok=true"
+        "  OK: marker turn finished and prompt returned idle; both inject RPCs ok=true"
     );
 
     // ── Phase 10: real send+reply round-trip via relay ───────────
@@ -1296,6 +1492,11 @@ fn test_relay_roundtrip() {
     // Watermark Device A's events so we only count relayed replies that
     // arrive AFTER the question goes out.
     let pre_send_event_a = last_event_id(&path_a);
+    // Same for Device B's own status events: without this, a stale
+    // delivery→listening cycle already sitting in the last-20 window (e.g.
+    // Phase 9's inject turn) could satisfy the Step 1 scan below by
+    // coincidence rather than by actually observing this message's turn.
+    let pre_send_event_b = last_event_id(&path_b);
 
     // Send from bigboss (`-b`) rather than a synthetic `--from` label.
     // `--from <name>` is a CLI-only sender stamp with no return route on
@@ -1318,23 +1519,39 @@ fn test_relay_roundtrip() {
         "  OK: sent question from bigboss to @{launched_name}:{short_b}"
     );
 
-    // Step 1: Device B's claude received and processed (status round-trip).
     poll_until(
         || {
-            let out = hcom_with_dir(
-                &format!("events --type status --agent {launched_name} --last 20"),
-                &path_b,
-            );
-            if !out.status.success() {
-                return None;
-            }
-            let mut saw_delivery = false;
-            let mut saw_listening_after = false;
+            let out = hcom_with_dir("events --type message --last 20", &path_b);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains(question).then_some(())
+        },
+        "Device B received targeted Phase 10 message",
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    );
+    logln!(log, "  OK: Device B received targeted Phase 10 message");
+
+    // Step 1: Device B's claude received and processed (status round-trip).
+    let step1_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = hcom_with_dir(
+            &format!("events --type status --agent {launched_name} --last 20"),
+            &path_b,
+        );
+        let mut saw_delivery = false;
+        let mut saw_listening_after = false;
+        if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let ev: serde_json::Value = match serde_json::from_str(line.trim()) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Events are returned oldest-first; ignore anything at or
+                // before the pre-send watermark so a stale delivery→listening
+                // cycle already in the last-20 window can't false-match.
+                if ev["id"].as_i64().unwrap_or(0) <= pre_send_event_b {
+                    continue;
+                }
                 let data = &ev["data"];
                 let ctx = data["context"].as_str().unwrap_or("");
                 let status = data["status"].as_str().unwrap_or("");
@@ -1346,24 +1563,27 @@ fn test_relay_roundtrip() {
                     saw_listening_after = true;
                 }
             }
-            if saw_delivery && saw_listening_after {
-                Some(())
-            } else {
-                None
-            }
-        },
-        &format!("{launched_name} processed message (delivery → listening)"),
-        Duration::from_secs(120),
-        Duration::from_secs(2),
-    );
+        }
+        if saw_delivery && saw_listening_after {
+            break;
+        }
+        if Instant::now() >= step1_deadline {
+            panic!(
+                "Timeout (120s): {launched_name} processed message (delivery → listening)\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
     logln!(
         log,
         "  OK: {launched_name} processed the message and returned to listening"
     );
 
-    // Device A's worker may have auto-exited during the long status wait
-    // (watchdog exits after ~60s with no local instances). Re-arm so the
-    // PONG reply event can land here.
+    // Device A's worker auto-exits only when relay is *not* enabled in its
+    // config (see `auto_exit_watchdog` in src/relay/worker.rs) — both devices
+    // enabled relay in Phases 1/3, so this is just cheap insurance, not a
+    // known race fix.
     ensure_relay_worker(&path_a);
 
     // Step 2: the real round-trip — claude's PONG reply must reach
@@ -1372,12 +1592,11 @@ fn test_relay_roundtrip() {
     // claude wrote something locally on Device B.
     let expected_from = format!("{launched_name}:{short_b}");
     let mut last_log_count = 0usize;
-    let pong_event = poll_until(
-        || {
-            let out = hcom_with_dir("events --type message --last 50", &path_a);
-            if !out.status.success() {
-                return None;
-            }
+    let pong_deadline = Instant::now() + Duration::from_secs(90);
+    let pong_event = loop {
+        let out = hcom_with_dir("events --type message --last 50", &path_a);
+        let mut found = None;
+        if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let mut new_count = 0usize;
             for line in stdout.lines() {
@@ -1399,21 +1618,28 @@ fn test_relay_roundtrip() {
                 let from = data["from"].as_str().unwrap_or("");
                 let text = data["text"].as_str().unwrap_or("");
                 if from == expected_from && text.to_uppercase().contains("PONG") {
-                    return Some(ev);
+                    found = Some(ev);
+                    break;
                 }
             }
-            if new_count != last_log_count {
+            if found.is_none() && new_count != last_log_count {
                 last_log_count = new_count;
                 eprintln!(
                     "    {new_count} new message events on A, none from {expected_from} with PONG yet"
                 );
             }
-            None
-        },
-        &format!("Device A receives PONG reply event from {expected_from}"),
-        Duration::from_secs(90),
-        Duration::from_secs(2),
-    );
+        }
+        if let Some(ev) = found {
+            break ev;
+        }
+        if Instant::now() >= pong_deadline {
+            panic!(
+                "Timeout (90s): Device A receives PONG reply event from {expected_from}\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    };
     logln!(
         log,
         "  OK: Device A received PONG reply event (id={}, from={expected_from})",
@@ -1507,19 +1733,14 @@ fn test_relay_roundtrip() {
 
     // Double-check directly against Device B's SQLite DB.
     let db_path_b = Path::new(&path_b).join("hcom.db");
-    let sql_out = Command::new("sqlite3")
-        .arg(&db_path_b)
-        .arg(format!(
-            "SELECT tag FROM instances WHERE name='{launched_name}'"
-        ))
-        .output()
-        .expect("failed to run sqlite3");
-    assert!(
-        sql_out.status.success(),
-        "sqlite3 failed: {}",
-        String::from_utf8_lossy(&sql_out.stderr)
-    );
-    let sql_tag = String::from_utf8_lossy(&sql_out.stdout).trim().to_string();
+    let db = rusqlite::Connection::open(&db_path_b).expect("open Device B database");
+    let sql_tag: String = db
+        .query_row(
+            "SELECT tag FROM instances WHERE name = ?1",
+            rusqlite::params![launched_name],
+            |row| row.get(0),
+        )
+        .expect("read Device B instance tag");
     assert_eq!(
         sql_tag, "test-relay-tag",
         "Device B DB tag column != test-relay-tag: {sql_tag:?}"
@@ -1562,12 +1783,24 @@ fn test_relay_roundtrip() {
         "  OK: Device A removed mirrored remote instance after kill"
     );
 
-    // After the kill, a remote term_screen must fail (no inject port).
-    let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
-    let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
-    assert!(
-        post_kill_stdout.contains("Remote term screen failed") || !post_kill_term.status.success(),
-        "term_screen should fail after kill, got stdout:\n{post_kill_stdout}"
+    // After the kill, a remote term_screen must eventually fail (no inject
+    // port). The killed instance's DB row clears as soon as its tracked child
+    // process dies, but the PTY manager process behind the inject port can
+    // legitimately outlive that by a couple of seconds — its reader thread
+    // joins the ConPTY pipe with a bounded 2s timeout before tearing itself
+    // down (see `join_with_timeout` in `src/pty/win.rs`) — so poll rather
+    // than asserting on the very first check.
+    poll_until(
+        || {
+            let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
+            let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
+            (post_kill_stdout.contains("Remote term screen failed")
+                || !post_kill_term.status.success())
+            .then_some(())
+        },
+        "term_screen should fail after kill",
+        Duration::from_secs(10),
+        Duration::from_millis(300),
     );
     logln!(log, "  OK: term_screen after kill fails as expected");
 

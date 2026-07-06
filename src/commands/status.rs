@@ -29,11 +29,19 @@ fn path_exists_or_symlink(path: &Path) -> bool {
     path.exists() || std::fs::symlink_metadata(path).is_ok()
 }
 
+/// Cross-platform PATH scan tolerant of dangling symlinks — status display
+/// wants "is this installed" even for a symlink whose target is momentarily
+/// missing (e.g. mid-upgrade via nvm/homebrew), unlike `which_bin`, whose
+/// results get executed and so require the target to actually resolve.
 fn is_in_path(name: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|dir| path_exists_or_symlink(&Path::new(dir).join(name)))
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        crate::terminal::which_candidates(&dir, name)
+            .iter()
+            .any(|candidate| path_exists_or_symlink(candidate))
+    })
 }
 
 fn is_antigravity_installed() -> bool {
@@ -233,7 +241,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         true
     } else {
-        crate::config::is_known_terminal_preset_pub(&terminal_config)
+        let platform = crate::shared::platform::platform_name();
+        (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config)
     };
 
     // Relay — use proper status from relay module
@@ -367,7 +378,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         println!("terminal:  {terminal_config}");
     } else {
-        let available = crate::config::is_known_terminal_preset_pub(&terminal_config);
+        let platform = crate::shared::platform::platform_name();
+        let available = (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config);
         let sym = if available { "✓" } else { "✗" };
         println!("terminal:  {terminal_config} {sym}");
     }
@@ -573,13 +587,6 @@ mod tests {
         assert_eq!(t.symbol(), "✗");
     }
 
-    #[test]
-    fn test_is_in_path() {
-        // ls should be in PATH on any Unix system
-        assert!(is_in_path("ls"));
-        assert!(!is_in_path("definitely_not_a_real_binary_xyz123"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn test_path_exists_or_symlink_accepts_broken_symlink() {
@@ -587,6 +594,29 @@ mod tests {
         let link = dir.path().join("shim");
         std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
         assert!(path_exists_or_symlink(&link));
+    }
+
+    // Unix-only: relies on `:`-separated PATH and a real symlink.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_is_in_path_tolerates_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("definitely_not_a_real_binary_xyz123");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
+
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+        assert!(is_in_path("definitely_not_a_real_binary_xyz123"));
+        assert!(!is_in_path("also_not_a_real_binary_abc456"));
+        unsafe {
+            match &original_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
     }
 
     #[test]
@@ -647,6 +677,46 @@ mod tests {
                 std::env::remove_var("HOME");
             }
         }
+    }
+
+    // B-2: preset availability must match the validate/launch platform gate —
+    // a wrong-platform built-in is NOT available, and a user-defined preset IS.
+    #[test]
+    #[serial]
+    fn terminal_availability_matches_platform_gate() {
+        use crate::hooks::test_helpers::isolated_test_env;
+
+        // Mirrors the `available` expression at both status sites.
+        let available = |name: &str| {
+            let platform = crate::shared::platform::platform_name();
+            (crate::config::is_known_terminal_preset_pub(name)
+                && crate::config::terminal_preset_supported_on(name, platform))
+                || crate::config::is_user_defined_preset(name)
+        };
+
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        let builtin = match platform {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+
+        // Wrong-platform built-in with no user override: not available.
+        assert!(
+            !available(builtin),
+            "{builtin} must show unavailable on {platform}"
+        );
+
+        // A user-defined preset of the same name: available.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"{builtin} {{script}}\"\n"),
+        )
+        .unwrap();
+        assert!(
+            available(builtin),
+            "user-defined {builtin} must show available on {platform}"
+        );
     }
 
     #[test]

@@ -335,20 +335,33 @@ impl HcomConfig {
             errors.insert("terminal".into(), "terminal cannot be empty".into());
         } else if self.terminal != "default" && self.terminal != "print" && self.terminal != "here"
         {
-            // Check against built-in presets + user-defined TOML presets
-            let known =
-                is_known_terminal_preset(&self.terminal) || is_user_defined_preset(&self.terminal);
-            if !known {
-                // Not a known preset — must be a custom command with {script}
-                if !self.terminal.contains("{script}") {
+            let platform = crate::shared::platform::platform_name();
+            if let Some(error) = user_defined_preset_error(&self.terminal) {
+                errors.insert(
+                    "terminal".into(),
+                    format!("invalid terminal preset '{}': {error}", self.terminal),
+                );
+            } else if is_user_defined_preset(&self.terminal) {
+                // User TOML presets declare no platform and override any built-in
+                // of the same name — exempt from the built-in platform gate.
+            } else if is_known_terminal_preset(&self.terminal) {
+                if !terminal_preset_supported_on(&self.terminal, platform) {
                     errors.insert(
                         "terminal".into(),
                         format!(
-                            "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
-                            self.terminal
+                            "terminal preset '{}' is not available on {}",
+                            self.terminal, platform
                         ),
                     );
                 }
+            } else if !self.terminal.contains("{script}") {
+                errors.insert(
+                    "terminal".into(),
+                    format!(
+                        "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
+                        self.terminal
+                    ),
+                );
             }
         }
 
@@ -993,6 +1006,14 @@ fn is_known_terminal_preset(name: &str) -> bool {
         .any(|(p, _)| p.eq_ignore_ascii_case(name))
 }
 
+/// True if `name` is a built-in preset supported on `platform`
+/// ("Darwin"/"Linux"/"Windows", see `crate::shared::platform::platform_name`).
+pub fn terminal_preset_supported_on(name: &str, platform: &str) -> bool {
+    TERMINAL_PRESETS
+        .iter()
+        .any(|(p, preset)| p.eq_ignore_ascii_case(name) && preset.platforms.contains(&platform))
+}
+
 /// Resolve old casing to canonical preset name (e.g., "WezTerm" → "wezterm").
 /// Returns the canonical name if matched, otherwise returns the input unchanged.
 fn normalize_terminal_case(name: &str) -> String {
@@ -1004,13 +1025,43 @@ fn normalize_terminal_case(name: &str) -> String {
     name.to_string()
 }
 
+fn user_defined_preset_error(name: &str) -> Option<String> {
+    let presets = load_toml_presets(&paths::config_toml_path())?;
+    let (_, value) = presets
+        .as_table()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))?;
+    let preset = match value.as_table() {
+        Some(preset) => preset,
+        None => return Some("expected a table".to_string()),
+    };
+    for field in ["open", "close"] {
+        if let Some(value) = preset.get(field)
+            && let Err(error) = toml_val_to_argv(value)
+        {
+            return Some(format!("{field}: {error}"));
+        }
+    }
+    None
+}
+
 /// Check if a terminal name matches a user-defined preset in config.toml.
 pub fn is_user_defined_preset(name: &str) -> bool {
     let toml_path = paths::config_toml_path();
     if let Some(presets_val) = load_toml_presets(&toml_path)
         && let Some(table) = presets_val.as_table()
     {
-        return table.keys().any(|k| k.eq_ignore_ascii_case(name));
+        return table.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(name)
+                && value.as_table().is_some_and(|preset| {
+                    preset.get("open").map(toml_val_to_argv).transpose().is_ok()
+                        && preset
+                            .get("close")
+                            .map(toml_val_to_argv)
+                            .transpose()
+                            .is_ok()
+                })
+        });
     }
     false
 }
@@ -1036,28 +1087,30 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
                     .map(|(_, v)| v)
             })?
             .as_table()?;
-        Some(TomlPresetFields {
-            binary: val
-                .get("binary")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            app_name: val
-                .get("app_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            open: val
-                .get("open")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            close: val
-                .get("close")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            pane_id_env: val
-                .get("pane_id_env")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-        })
+        let open_result = val.get("open").map(toml_val_to_argv).transpose();
+        let close_result = val.get("close").map(toml_val_to_argv).transpose();
+        match (open_result, close_result) {
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("Warning: skipping custom terminal preset {name:?}: {e}");
+                None
+            }
+            (Ok(open), Ok(close)) => Some(TomlPresetFields {
+                binary: val
+                    .get("binary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                app_name: val
+                    .get("app_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                open: open.flatten(),
+                close: close.flatten(),
+                pane_id_env: val
+                    .get("pane_id_env")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            }),
+        }
     });
 
     let builtin = crate::shared::get_terminal_preset(name);
@@ -1065,20 +1118,45 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     match (&toml_preset, &builtin) {
         (None, None) => None,
         _ => {
-            let b_open = builtin.map(|b| b.open).unwrap_or("");
-            let b_close = builtin.and_then(|b| b.close);
+            // Built-in argv templates, lowered to owned Vec<String> per platform.
+            let argv_vec = |sel: Option<crate::shared::terminal_presets::ArgvTemplate>| {
+                sel.map(|t| t.iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            };
+            let b_open = builtin.map(|b| b.open);
+            let b_close = builtin.map(|b| b.close);
             let b_binary = builtin.and_then(|b| b.binary);
             let b_app = builtin.and_then(|b| b.app_name);
             let b_pane_env = builtin.and_then(|b| b.pane_id_env);
 
             let t = toml_preset.as_ref();
+
+            // A TOML `open`/`close` override (string or array) replaces the
+            // built-in on BOTH platforms — TOML custom presets have no separate
+            // Windows slot, so the array form is the Windows escape hatch (it
+            // can carry literal Windows paths without shell mangling).
+            let toml_open = t.and_then(|t| t.open.clone());
+            let toml_close = t.and_then(|t| t.close.clone());
+
+            let (open, open_windows) = match toml_open {
+                Some(o) => (o, None),
+                None => (
+                    argv_vec(b_open.and_then(|o| o.default)).unwrap_or_default(),
+                    argv_vec(b_open.and_then(|o| o.windows)),
+                ),
+            };
+            let (close, close_windows) = match toml_close {
+                Some(c) => (Some(c), None),
+                None => (
+                    argv_vec(b_close.and_then(|c| c.default)),
+                    argv_vec(b_close.and_then(|c| c.windows)),
+                ),
+            };
+
             Some(MergedPreset {
-                open: t
-                    .and_then(|t| t.open.clone())
-                    .unwrap_or_else(|| b_open.to_string()),
-                close: t
-                    .and_then(|t| t.close.clone())
-                    .or_else(|| b_close.map(|s| s.to_string())),
+                open,
+                open_windows,
+                close,
+                close_windows,
                 binary: t
                     .and_then(|t| t.binary.clone())
                     .or_else(|| b_binary.map(|s| s.to_string())),
@@ -1093,23 +1171,119 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     }
 }
 
+/// Convert a TOML preset `open`/`close` value into an argv vector.
+///
+/// Accepts BOTH forms:
+/// - Array: each element must be a string; non-string elements are an error.
+///   Literal Windows paths like `C:\Users\x\s.ps1` survive intact — this is
+///   the recommended escape hatch for custom presets.
+/// - String (legacy): tokenized once via the double-quote-aware
+///   `args_common::shell_split`. Backslashes are consumed by that tokenizer, so
+///   the array form is preferred for Windows paths. A `\` in the string triggers
+///   a warning so users can migrate to the array form.
+///
+/// Returns `Ok(None)` for an empty string/array (treated as "unset").
+/// Returns `Err` on non-string array elements or invalid shell quoting — the
+/// caller should treat this as a configuration error rather than falling back
+/// to a built-in preset.
+fn toml_val_to_argv(v: &toml::Value) -> Result<Option<Vec<String>>, String> {
+    match v {
+        toml::Value::Array(items) => {
+            if items.is_empty() {
+                return Ok(None);
+            }
+            let mut argv = Vec::with_capacity(items.len());
+            for (i, e) in items.iter().enumerate() {
+                match e.as_str() {
+                    Some(s) => argv.push(s.to_string()),
+                    None => {
+                        return Err(format!(
+                            "element [{}] is not a string (got {}); use quoted strings",
+                            i,
+                            e.type_str()
+                        ));
+                    }
+                }
+            }
+            Ok(Some(argv))
+        }
+        toml::Value::String(s) => {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            if s.contains('\\') {
+                eprintln!(
+                    "Warning: custom terminal preset command contains backslashes; \
+                     use the array form to avoid shell tokenization issues on Windows: {s:?}"
+                );
+            }
+            match crate::tools::args_common::shell_split(s, cfg!(windows)) {
+                Ok(argv) if !argv.is_empty() => Ok(Some(argv)),
+                Ok(_) => Ok(None),
+                Err(e) => Err(format!("invalid quoting in preset command: {e}")),
+            }
+        }
+        _ => Err(format!(
+            "expected a string or array of strings, got {}",
+            v.type_str()
+        )),
+    }
+}
+
 /// Parsed TOML preset fields (all optional — overlay on built-in).
 struct TomlPresetFields {
     binary: Option<String>,
     app_name: Option<String>,
-    open: Option<String>,
-    close: Option<String>,
+    open: Option<Vec<String>>,
+    close: Option<Vec<String>>,
     pane_id_env: Option<String>,
 }
 
-/// Fully merged terminal preset (TOML + built-in).
+/// Fully merged terminal preset (TOML + built-in), as argument vectors.
 #[derive(Debug, Clone)]
 pub struct MergedPreset {
-    pub open: String,
-    pub close: Option<String>,
+    /// Default (Unix / fallback) open argv.
+    pub open: Vec<String>,
+    /// Windows-specific open argv override (None ⇒ use `open`).
+    pub open_windows: Option<Vec<String>>,
+    /// Default (Unix / fallback) close argv (None ⇒ no close API).
+    pub close: Option<Vec<String>>,
+    /// Windows-specific close argv override (None ⇒ use `close`).
+    pub close_windows: Option<Vec<String>>,
     pub binary: Option<String>,
     pub app_name: Option<String>,
     pub pane_id_env: Option<String>,
+}
+
+impl MergedPreset {
+    /// Open argv for the given platform (Windows falls back to the default).
+    pub fn open_argv(&self, is_windows: bool) -> Vec<String> {
+        if is_windows {
+            self.open_windows
+                .clone()
+                .unwrap_or_else(|| self.open.clone())
+        } else {
+            self.open.clone()
+        }
+    }
+
+    /// Close argv for the given platform (Windows falls back to the default).
+    pub fn close_argv(&self, is_windows: bool) -> Option<Vec<String>> {
+        if is_windows {
+            self.close_windows.clone().or_else(|| self.close.clone())
+        } else {
+            self.close.clone()
+        }
+    }
+
+    /// Whether a close API exists for the given platform (no clone).
+    pub fn has_close(&self, is_windows: bool) -> bool {
+        if is_windows {
+            self.close_windows.is_some() || self.close.is_some()
+        } else {
+            self.close.is_some()
+        }
+    }
 }
 
 fn is_falsy(s: &str) -> bool {
@@ -1340,6 +1514,9 @@ mod tests {
         }
     }
 
+    // Unix-only: asserts against $HOME and POSIX absolute paths; Windows
+    // resolves the base dir from USERPROFILE and treats "/x" as drive-relative.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_default_config_uses_home_hcom() {
@@ -1354,6 +1531,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_hcom_dir_overrides_home() {
@@ -1450,6 +1628,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn test_hcom_dir_absolute_stays_absolute() {
@@ -1565,8 +1744,14 @@ mod tests {
 
         config.terminal = "KITTY".to_string();
         let errors = config.collect_errors();
-        assert!(!errors.contains_key("terminal"));
-        assert_eq!(config.terminal, "kitty");
+        assert_eq!(config.terminal, "kitty"); // Normalized regardless of platform
+        // kitty is Darwin/Linux-only (DL); on Windows it's correctly rejected
+        // by the platform-availability check added for finding #17.
+        if crate::shared::platform::platform_name() == "Windows" {
+            assert!(errors.contains_key("terminal"));
+        } else {
+            assert!(!errors.contains_key("terminal"));
+        }
     }
 
     #[test]
@@ -1584,6 +1769,9 @@ mod tests {
 
     #[test]
     fn test_terminal_known_presets_accepted() {
+        // Finding 17: presets are now validated against the host platform, so
+        // only assert presets that are actually supported here.
+        let platform = crate::shared::platform::platform_name();
         let mut config = HcomConfig::default();
         for preset in &[
             "kitty",
@@ -1593,12 +1781,28 @@ mod tests {
             "terminal.app",
             "iterm",
         ] {
+            if !terminal_preset_supported_on(preset, platform) {
+                continue;
+            }
             config.terminal = preset.to_string();
             assert!(
                 !config.collect_errors().contains_key("terminal"),
-                "preset '{preset}' should be valid"
+                "preset '{preset}' should be valid on {platform}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn wrong_platform_builtin_preset_is_rejected() {
+        // Finding 17: a built-in preset not available on the host platform
+        // (here, "wttab" is Windows-only) must be rejected at validation time,
+        // not just silently accepted and left to fail at launch.
+        let mut config = HcomConfig {
+            terminal: "wttab".to_string(),
+            ..HcomConfig::default()
+        };
+        assert!(config.collect_errors().contains_key("terminal"));
     }
 
     #[test]
@@ -2022,6 +2226,155 @@ binary = "myterm"
         assert!(presets.is_some());
         let presets = presets.unwrap();
         assert!(presets.as_table().unwrap().contains_key("myterm"));
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_preserves_windows_path() {
+        // Array form: elements collected verbatim, so a literal Windows path
+        // (backslashes, drive letter) survives without tokenization.
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::String("-e".into()),
+            toml::Value::String(r"C:\Users\x\s.ps1".into()),
+        ]);
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Ok(Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                r"C:\Users\x\s.ps1".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_rejects_non_string_element() {
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::Integer(42),
+            toml::Value::String("{script}".into()),
+        ]);
+        assert!(toml_val_to_argv(&v).is_err());
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_string_tokenizes_legacy() {
+        let v = toml::Value::String("myterm -e bash {script}".into());
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Ok(Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                "bash".to_string(),
+                "{script}".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_string_invalid_quoting_returns_err() {
+        let v = toml::Value::String(r#"kitty -- bash "unterminated"#.into());
+        assert!(toml_val_to_argv(&v).is_err());
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_empty_and_wrong_type() {
+        assert!(toml_val_to_argv(&toml::Value::Integer(3)).is_err());
+        assert_eq!(toml_val_to_argv(&toml::Value::Array(vec![])), Ok(None));
+        assert_eq!(
+            toml_val_to_argv(&toml::Value::String(String::new())),
+            Ok(None)
+        );
+    }
+
+    // B-1: a user-defined `[terminal.presets.<builtin>]` override declares no
+    // platform and takes precedence over the built-in, so it must be accepted
+    // even on a platform where the built-in itself is unavailable.
+    #[test]
+    #[serial]
+    fn user_defined_override_exempt_from_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        // A built-in preset NOT available on the current host platform.
+        let builtin = match platform {
+            // windows-terminal is Windows-only.
+            "Darwin" | "Linux" => "windows-terminal",
+            // iterm is Darwin-only.
+            _ => "iterm",
+        };
+
+        // Control: without any user override the wrong-platform built-in is
+        // rejected at validate time.
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "built-in {builtin} should be rejected on {platform} without a user override"
+        );
+
+        // Define a user preset with the SAME name — it must now be accepted.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!(
+                "[terminal.presets.{builtin}]\nopen = \"{builtin} -- powershell -File {{script}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !cfg.collect_errors().contains_key("terminal"),
+            "user-defined override of {builtin} must be accepted on {platform}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_does_not_bypass_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = match crate::shared::platform::platform_name() {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"powershell \\\"unterminated\"\n"),
+        )
+        .unwrap();
+
+        assert!(!is_user_defined_preset(builtin));
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "malformed override must not exempt {builtin} from the platform gate"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_rejected_for_supported_builtin() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = if cfg!(windows) { "cmd" } else { "tmux" };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nclose = 42\n"),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+
+        let error = cfg.collect_errors().remove("terminal").unwrap();
+        assert!(error.contains("invalid terminal preset"));
+        assert!(error.contains("close:"));
     }
 
     #[test]

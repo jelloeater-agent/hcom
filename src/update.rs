@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(86400); // 24 hours
+const UNIX_INSTALL_CMD: &str =
+    "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh";
+const WINDOWS_INSTALL_CMD: &str = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex\"";
 
 pub(crate) fn flag_path() -> PathBuf {
     hcom_path(&[FLAGS_DIR, "update_check"])
@@ -28,7 +31,15 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 
 /// Spawn a detached background process to fetch latest version and write the cache file.
 /// Returns immediately — result shows up on next command.
+///
+/// No-op on Windows: the script below is POSIX (`sh -c`, `awk`, `git`/`curl`
+/// piping), and there's no `sh` to run it. Porting this to PowerShell is
+/// disproportionate for a fire-and-forget cache refresh (errors are already
+/// silently swallowed), so Windows just skips the doomed spawn attempt.
 fn spawn_background_check(flag: &Path, current: &str) {
+    if cfg!(windows) {
+        return;
+    }
     let flag_str = flag.to_string_lossy().to_string();
     let current = current.to_string();
 
@@ -159,18 +170,47 @@ pub fn fetch_update_info() -> anyhow::Result<UpdateInfo> {
     })
 }
 
+/// Whether `cmd` needs POSIX shell semantics to run (currently: only the
+/// curl-installer fallback, which is a pipe to `sh`). All other commands
+/// `get_update_cmd()` returns (`pip install -U hcom`, `uv tool upgrade hcom`,
+/// `brew upgrade hcom`) are a plain program + args and need no shell at all.
+///
+/// Platform-independent so it's testable on any host; `cmd_update` uses this
+/// on Windows (which has no `sh`) to decide whether to refuse instead of
+/// attempting a doomed spawn.
+pub(crate) fn is_shell_pipe_command(cmd: &str) -> bool {
+    cmd.starts_with("curl ")
+}
+
+pub(crate) fn is_powershell_installer_command(cmd: &str) -> bool {
+    cmd == WINDOWS_INSTALL_CMD
+}
+
+/// Split a plain `program arg1 arg2 ...` command string into program + args.
+/// Only meant for the shell-free update commands `get_update_cmd()` returns
+/// (no quoting to worry about); not a general shell parser.
+pub(crate) fn split_program_args(cmd: &str) -> Option<(&str, Vec<&str>)> {
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
 /// Detect install method and return appropriate update command.
 fn get_update_cmd() -> &'static str {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(_) => {
-            return "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh";
-        }
+        Err(_) => return platform_installer_cmd(),
     };
+    get_update_cmd_for_exe(&exe)
+}
 
+fn get_update_cmd_for_exe(exe: &Path) -> &'static str {
     // Resolve symlinks (e.g. Homebrew Cellar, uv shims).
-    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let path_str = resolved.to_string_lossy();
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    // Normalizing separators also makes install detection testable and handles
+    // native Windows paths without duplicating every path pattern.
+    let path_str = resolved.to_string_lossy().replace('\\', "/");
+    let path_lower = path_str.to_ascii_lowercase();
 
     // Homebrew install (Cellar path on both Apple Silicon and Intel)
     if path_str.contains("/Cellar/") {
@@ -178,14 +218,15 @@ fn get_update_cmd() -> &'static str {
     }
 
     // uv tool install
-    if path_str.contains("/uv/") || path_str.contains("/.local/share/uv/") {
+    if path_lower.contains("/uv/") || path_lower.contains("/.local/share/uv/") {
         return "uv tool upgrade hcom";
     }
 
     // pip install inside a venv or directly in site-packages/dist-packages
-    if path_str.contains("/site-packages/")
-        || path_str.contains("/dist-packages/")
-        || path_str.contains("/venv/")
+    if path_lower.contains("/site-packages/")
+        || path_lower.contains("/dist-packages/")
+        || path_lower.contains("/venv/")
+        || path_lower.contains("/.venv/")
     {
         return "pip install -U hcom";
     }
@@ -196,10 +237,25 @@ fn get_update_cmd() -> &'static str {
         return "pip install -U hcom";
     }
 
-    // Default: curl installer
-    "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh"
+    platform_installer_cmd()
 }
 
+fn platform_installer_cmd() -> &'static str {
+    if cfg!(windows) {
+        WINDOWS_INSTALL_CMD
+    } else {
+        UNIX_INSTALL_CMD
+    }
+}
+
+// NOTE: only checks the Unix `~/.local/bin` + `~/.local/lib/pythonX.Y/site-packages`
+// layout. A Windows `pip install --user hcom` uses a different layout (e.g.
+// under `%APPDATA%\Python`), which this doesn't detect — such an install
+// would fall through to the curl-installer default on Windows. Not adding a
+// Windows branch here without being able to verify the actual path layout on
+// a real Windows/Python install; this is a known, low-risk gap (worst case:
+// `hcom update` on Windows suggests the wrong command for this one install
+// method, users can still update manually).
 fn is_user_site_pip_install(exe: &Path) -> bool {
     let home = match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home),
@@ -304,6 +360,33 @@ mod tests {
     }
 
     #[test]
+    fn test_is_shell_pipe_command() {
+        assert!(is_shell_pipe_command(
+            "curl -fsSL https://example.com/install.sh | sh"
+        ));
+        assert!(!is_shell_pipe_command("pip install -U hcom"));
+        assert!(!is_shell_pipe_command("uv tool upgrade hcom"));
+        assert!(!is_shell_pipe_command("brew upgrade hcom"));
+        assert!(!is_shell_pipe_command(WINDOWS_INSTALL_CMD));
+        assert!(is_powershell_installer_command(WINDOWS_INSTALL_CMD));
+        assert!(!is_powershell_installer_command("pip install -U hcom"));
+    }
+
+    #[test]
+    fn test_split_program_args() {
+        assert_eq!(
+            split_program_args("pip install -U hcom"),
+            Some(("pip", vec!["install", "-U", "hcom"]))
+        );
+        assert_eq!(
+            split_program_args("uv tool upgrade hcom"),
+            Some(("uv", vec!["tool", "upgrade", "hcom"]))
+        );
+        assert_eq!(split_program_args(""), None);
+        assert_eq!(split_program_args("   "), None);
+    }
+
+    #[test]
     fn test_version_comparison() {
         assert!(parse_version("0.8.0") > parse_version("0.7.0"));
         assert!(parse_version("1.0.0") > parse_version("0.99.99"));
@@ -312,10 +395,30 @@ mod tests {
 
     #[test]
     fn test_get_update_cmd_default() {
-        // Test binary path won't match any known install method, so we expect
-        // the curl installer fallback.
+        // Test binary path won't match any known install method.
         let cmd = get_update_cmd();
-        assert!(cmd.contains("curl"), "expected curl fallback, got: {cmd}");
+        if cfg!(windows) {
+            assert!(
+                cmd.contains("hcom-installer.ps1"),
+                "expected PowerShell fallback, got: {cmd}"
+            );
+        } else {
+            assert!(cmd.contains("curl"), "expected curl fallback, got: {cmd}");
+        }
+    }
+
+    #[test]
+    fn test_windows_style_install_paths_are_detected() {
+        assert_eq!(
+            get_update_cmd_for_exe(Path::new(
+                r"C:\Users\me\AppData\Local\uv\tools\hcom\Scripts\hcom.exe"
+            )),
+            "uv tool upgrade hcom"
+        );
+        assert_eq!(
+            get_update_cmd_for_exe(Path::new(r"C:\Users\me\project\.venv\Scripts\hcom.exe")),
+            "pip install -U hcom"
+        );
     }
 
     #[test]

@@ -328,7 +328,7 @@ fn validate_config_args(field_name: &str, value: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let tokens = crate::tools::args_common::shell_split(value)
+    let tokens = crate::tools::args_common::shell_split(value, cfg!(windows))
         .map_err(|e| format!("invalid {field_name} from config: {e}"))?;
     let errors = validate_tool_args(&tool, &tokens);
     if errors.is_empty() {
@@ -1722,12 +1722,13 @@ pub fn terminal_help_text(show_current: bool) -> String {
             };
             lines.push(format!("Current: default (auto-detect){suffix}"));
         } else {
-            let kind =
-                if crate::config::get_merged_preset(&current).is_some_and(|p| p.close.is_some()) {
-                    "managed"
-                } else {
-                    "open only"
-                };
+            let kind = if crate::config::get_merged_preset(&current)
+                .is_some_and(|p| p.has_close(cfg!(windows)))
+            {
+                "managed"
+            } else {
+                "open only"
+            };
             lines.push(format!("Current: {current} ({kind}) [{source}]"));
         }
         lines.push(String::new());
@@ -1766,7 +1767,8 @@ pub fn terminal_help_text(show_current: bool) -> String {
     lines.push(String::new());
     lines.push("Other (opens window only):".to_string());
     for (name, preset) in TERMINAL_PRESETS.iter() {
-        if all_managed.contains(name) || preset.close.is_some() {
+        let has_close = preset.close.default.is_some() || preset.close.windows.is_some();
+        if all_managed.contains(name) || has_close {
             continue;
         }
         if !preset.platforms.is_empty() && !preset.platforms.contains(&platform) {
@@ -1784,10 +1786,11 @@ pub fn terminal_help_text(show_current: bool) -> String {
                 t.iter()
                     .filter(|(name, _)| !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()))
                     .map(|(name, val)| {
-                        let has_close = val
-                            .get("close")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|s| !s.is_empty());
+                        // close may be a legacy string or an argv array.
+                        let has_close = val.get("close").is_some_and(|v| {
+                            v.as_str().is_some_and(|s| !s.is_empty())
+                                || v.as_array().is_some_and(|a| !a.is_empty())
+                        });
                         (name.clone(), has_close)
                     })
                     .collect()
@@ -1919,9 +1922,16 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
             println!("Terminal: {current} [{source}]");
         }
         println!("\nAvailable presets:");
-        for (name, _preset) in TERMINAL_PRESETS.iter() {
+        let platform = crate::shared::platform::platform_name();
+        for (name, preset) in TERMINAL_PRESETS.iter() {
             let marker = if *name == current { " ← current" } else { "" };
-            println!("  {}{}", name, marker);
+            let availability =
+                if preset.platforms.is_empty() || preset.platforms.contains(&platform) {
+                    ""
+                } else {
+                    " (unavailable on this platform)"
+                };
+            println!("  {name}{availability}{marker}");
         }
         // Include TOML-defined presets not in built-ins
         let toml_path = crate::paths::config_toml_path();
@@ -1959,11 +1969,29 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         }
     }
 
+    if argv.len() > 1 || preset_name.contains("{script}") {
+        let command = argv.join(" ");
+        if !command.contains("{script}") {
+            eprintln!("Error: Custom terminal command must contain {{script}}");
+            return 1;
+        }
+        return match config_set("HCOM_TERMINAL", &command) {
+            Ok(()) => {
+                println!("Terminal set to custom command");
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                1
+            }
+        };
+    }
+
     // Validate preset exists (built-in or user-defined in config.toml)
-    let valid = TERMINAL_PRESETS
+    let builtin = TERMINAL_PRESETS
         .iter()
-        .any(|(name, _)| *name == preset_name.as_str())
-        || crate::config::is_user_defined_preset(preset_name);
+        .find(|(name, _)| *name == preset_name.as_str());
+    let valid = builtin.is_some() || crate::config::is_user_defined_preset(preset_name);
 
     if !valid {
         let mut available: Vec<&str> = TERMINAL_PRESETS.iter().map(|(name, _)| *name).collect();
@@ -1976,6 +2004,14 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         let user_refs: Vec<&str> = user_names.iter().map(|s| s.as_str()).collect();
         available.extend(user_refs);
         eprintln!("Available: {}", available.join(", "));
+        return 1;
+    }
+    let platform = crate::shared::platform::platform_name();
+    if let Some((_, preset)) = builtin
+        && !preset.platforms.is_empty()
+        && !preset.platforms.contains(&platform)
+    {
+        eprintln!("Error: Terminal preset '{preset_name}' is not available on {platform}");
         return 1;
     }
 
@@ -2345,7 +2381,7 @@ mod tests {
 
     #[test]
     fn test_terminal_help_text_documents_new_placeholders() {
-        // If you add a placeholder to parse_terminal_command, document it.
+        // If you add a placeholder to substitute_open_argv, document it.
         let help = terminal_help_text(false);
         for placeholder in ["{instance_name}", "{tool}", "{cwd}", "{pane_title}"] {
             assert!(

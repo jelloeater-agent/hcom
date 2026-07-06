@@ -183,6 +183,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     bail!("--dir path does not exist or is not a directory: {}", dir);
                 }
                 path.canonicalize()
+                    .map(|p| crate::shared::platform::child_process_path(&p))
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| dir.clone())
             } else {
@@ -500,7 +501,7 @@ fn append_config_args(config_args: &str, cli_args: &[String]) -> Vec<String> {
         // Don't silently drop hand-edited config args on a parse error (e.g. an
         // unterminated quote) — surface it so the launch isn't quietly missing
         // flags the user configured.
-        crate::tools::args_common::shell_split(config_args).unwrap_or_else(|err| {
+        crate::tools::args_common::shell_split(config_args, cfg!(windows)).unwrap_or_else(|err| {
             eprintln!("hcom: ignoring malformed configured args ({err}): {config_args}");
             Vec::new()
         })
